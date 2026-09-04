@@ -38,18 +38,30 @@ import {SourcingMathLib} from "./libraries/SourcingMathLib.sol";
 /// at execution time rather than trusted from the maker's signature, per the rule that every
 /// execution-time decision derives from on-chain state.
 ///
-/// @dev **This is the D2 happy path and it is knowingly incomplete in two ways**, both of which
-/// the plan schedules and the griefing test on D7 is designed to expose:
+/// @dev **Sourcing is buffer first, then a sized partial burn.** Idle loan token serves the fill
+/// outright; only the shortfall reaches the position, and only as much liquidity as that shortfall
+/// needs. Both halves matter for the same reason: every unwind drags a residual swap behind it, and
+/// every residual swap costs the maker fee plus impact at a price the taker chose the moment for.
+/// Repeated dust takes are extractive precisely because they force that swap over and over, so the
+/// defence is to not swap at all when the buffer covers it, and to swap as little as possible when
+/// it does not.
 ///
-///   1. `_sourceLoanToken` unwinds the position **in full**, whatever the fill size. Partial
-///      unwind is D3. Until then the first non-buffered take converts the whole LP position to
-///      loan token, which is safe but throws away the yield leg.
-///   2. The residual swap runs with **no price protection at all** — no `minOut`, and a
-///      sqrt-price limit set to the extremes. `PRICE_REF` and `MAX_SLIPPAGE_WAD` are held as
-///      immutables here but not yet read. Wiring them in is D8; D7 exists to first measure what
-///      that omission costs the maker.
+/// @dev **Knowingly incomplete in one way still.** The residual swap runs with **no price
+/// protection at all** — no `minOut`, and a sqrt-price limit set to the extremes. `PRICE_REF` and
+/// `MAX_SLIPPAGE_WAD` are held as immutables here and not yet read. That is scheduled, not
+/// overlooked: D7's griefing test needs an unprotected version to attack so the loss can be
+/// quantified, and D8 then wires the reference in and re-runs the same test.
+///
+/// @dev The burn sizing itself accounts for the swap fee but not for price impact, so it can come
+/// up short on a thin venue; `_sourceLoanToken` falls back to unwinding the remainder rather than
+/// failing a fill the position could have covered. Modelling the impact properly is D5/D6, and it
+/// is what removes the fallback.
 contract UniswapV3BuyCallback is UniswapBuyCallbackBase, IUniswapV3BuyCallback, IUniswapV3SwapCallback {
     using SafeCast for uint256;
+
+    /// @dev How far past the sized burn `_sourceLoanToken` may escalate when the estimate came up
+    /// short. See `_escalationCeiling`.
+    uint256 internal constant ESCALATION_FACTOR = 2;
 
     /// @dev Everything about the parked position that either half of the callback needs, read in
     /// one call. `positions` returns twelve values and only these seven are used.
@@ -76,6 +88,10 @@ contract UniswapV3BuyCallback is UniswapBuyCallbackBase, IUniswapV3BuyCallback, 
     address internal immutable ROUTE_TOKEN0;
     address internal immutable ROUTE_TOKEN1;
 
+    /// @dev The routing venue's fee, in hundredths of a bip. Feeds the burn sizing, which has to
+    /// know what the residual swap will cost before deciding how much to burn.
+    uint24 internal immutable ROUTE_FEE;
+
     constructor(
         address owner,
         address midnight,
@@ -92,6 +108,7 @@ contract UniswapV3BuyCallback is UniswapBuyCallbackBase, IUniswapV3BuyCallback, 
         ROUTE_POOL = routePool;
         ROUTE_TOKEN0 = IUniswapV3Pool(routePool).token0();
         ROUTE_TOKEN1 = IUniswapV3Pool(routePool).token1();
+        ROUTE_FEE = IUniswapV3Pool(routePool).fee();
     }
 
     /// SETTLEMENT ///
@@ -108,20 +125,79 @@ contract UniswapV3BuyCallback is UniswapBuyCallbackBase, IUniswapV3BuyCallback, 
 
         uint256 heldBefore = IERC20Extended(loanToken).balanceOf(address(this));
 
-        if (position.liquidity > 0) {
+        uint128 burn = _liquidityForShortfall(position, loanToken == position.token0, shortfall);
+        _unwind(tokenId, burn);
+        _swapWholeResidual(residualToken, loanToken);
+
+        uint256 sourced = IERC20Extended(loanToken).balanceOf(address(this)) - heldBefore;
+
+        // The sizing accounts for the swap fee but not yet for price impact, so it can come up
+        // short on a thin venue. Escalate rather than fail a fill the position could have covered —
+        // but only within a bounded multiple of what the fill itself justified.
+        //
+        // The bound is the whole point. Escalating straight to the remaining liquidity means any
+        // fill too small to survive the rounding in `liquidityForTarget` unwinds the entire
+        // position: a take of one wei sizes to a burn that yields zero tokens, comes up short, and
+        // takes the maker's whole LP with it. Proportionality is the invariant — the liquidity
+        // burnt must stay tied to the size of the fill, and a fill that cannot justify its own
+        // sourcing has to fail closed instead.
+        uint256 ceiling = _escalationCeiling(burn, position.liquidity);
+        if (sourced < shortfall && ceiling > burn) {
+            _unwind(tokenId, uint128(ceiling - burn));
+            _swapWholeResidual(residualToken, loanToken);
+            sourced = IERC20Extended(loanToken).balanceOf(address(this)) - heldBefore;
+        }
+
+        // Midnight checks that the tokens arrived, so this is strictly a better error message than
+        // a bare `transferFrom` failure — worth two warm balance reads in the contract whose whole
+        // point is failing honestly rather than filling badly.
+        require(sourced >= shortfall, InsufficientSourced());
+    }
+
+    /// @dev The most liquidity a fill may burn, given what the sizing said it needed. Twice the
+    /// sized burn: ample for the impact the 25bp margin failed to cover — that would have to be
+    /// eight times the margin before it bound — while keeping the burn proportional to the fill, so
+    /// a fill that cannot justify its own sourcing reverts rather than taking the position with it.
+    function _escalationCeiling(uint128 sized, uint128 available) internal pure returns (uint256) {
+        uint256 ceiling = uint256(sized) * ESCALATION_FACTOR;
+        return ceiling < available ? ceiling : available;
+    }
+
+    /// @dev How much of the position this fill needs. See `SourcingMathLib.liquidityForTarget` for
+    /// why the estimate leans towards burning too much rather than too little.
+    function _liquidityForShortfall(PositionState memory position, bool loanIsToken0, uint256 shortfall)
+        internal
+        view
+        returns (uint128)
+    {
+        if (position.liquidity == 0) return 0;
+
+        address pool = IUniswapV3Factory(FACTORY).getPool(position.token0, position.token1, position.fee);
+        (uint160 sqrtPriceX96,,,,,,) = IUniswapV3Pool(pool).slot0();
+
+        return SourcingMathLib.liquidityForTarget(
+            sqrtPriceX96,
+            TickMath.getSqrtPriceAtTick(position.tickLower),
+            TickMath.getSqrtPriceAtTick(position.tickUpper),
+            position.liquidity,
+            loanIsToken0,
+            shortfall,
+            ROUTE_FEE
+        );
+    }
+
+    /// @dev Burns `liquidity` and sweeps everything owed. `collect` takes the accrued fees along
+    /// with the burnt amounts, which is the yield leg of the position finally being realised.
+    function _unwind(uint256 tokenId, uint128 liquidity) internal {
+        if (liquidity > 0) {
             INonfungiblePositionManager(POSITION_MANAGER)
                 .decreaseLiquidity(
                     INonfungiblePositionManager.DecreaseLiquidityParams({
-                        tokenId: tokenId,
-                        liquidity: position.liquidity,
-                        amount0Min: 0,
-                        amount1Min: 0,
-                        deadline: block.timestamp
+                        tokenId: tokenId, liquidity: liquidity, amount0Min: 0, amount1Min: 0, deadline: block.timestamp
                     })
                 );
         }
 
-        // Also sweeps accrued fees, which is the yield leg of the position finally being realised.
         INonfungiblePositionManager(POSITION_MANAGER)
             .collect(
                 INonfungiblePositionManager.CollectParams({
@@ -131,15 +207,13 @@ contract UniswapV3BuyCallback is UniswapBuyCallbackBase, IUniswapV3BuyCallback, 
                     amount1Max: type(uint128).max
                 })
             );
+    }
 
+    /// @dev Swaps the callback's whole residual balance, which also sweeps up anything an earlier
+    /// fill left behind.
+    function _swapWholeResidual(address residualToken, address loanToken) internal {
         uint256 residual = IERC20Extended(residualToken).balanceOf(address(this));
         if (residual > 0) _swapResidual(residualToken, loanToken, residual);
-
-        // Midnight checks that the tokens arrived, so this is strictly a better error message than
-        // a bare `transferFrom` failure — worth two warm balance reads in the contract whose whole
-        // point is failing honestly rather than filling badly.
-        uint256 sourced = IERC20Extended(loanToken).balanceOf(address(this)) - heldBefore;
-        require(sourced >= shortfall, InsufficientSourced());
     }
 
     /// @dev Swaps the entire residual rather than only what the fill needs. Any excess becomes

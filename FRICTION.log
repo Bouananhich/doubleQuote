@@ -66,3 +66,13 @@ part that makes the feedback actionable and the part that is impossible to recon
     miscount compiles fine and reads the wrong field. Wrapped it in a local struct immediately.
     Not a blocker, but it is the kind of thing that makes an integration bug silent.
     (cost: ~5m)
+
+2026-09-05 --:--  [v3-periphery]  burning liquidity takes two calls and cannot pay out directly.
+    Expected decreaseLiquidity to return the tokens. It does not -- it credits tokensOwed on the
+    position, and a second collect() call moves them, so every unwind is two calls to the position
+    manager even when you want the whole thing in one place. v4 does the equivalent inside a single
+    unlock() with one netted delta, which is exactly the comparison this project exists to measure,
+    so this is a data point rather than a complaint. Noting it because the two-step is also what
+    makes a *partial* unwind awkward: you size the burn, then collect sweeps everything owed
+    including accrued fees, so the amount that arrives is not the amount you sized for.
+    (cost: ~15m reasoning about what collect actually returns)

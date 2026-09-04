@@ -34,12 +34,26 @@ real USDC/USDT 0.01% pool on the Base fork. **52/52** suite-wide.
 - Park and route proven independent — a callback routing through cbBTC/USDC rejects a swap callback
   from the pool its position is parked in.
 
+## D3 — done
+
+Sized partial unwind. **77/77.**
+
+- `SourcingMathLib.liquidityForTarget` sizes the burn as a single proportion — amounts are exactly
+  linear in liquidity — plus a 25bp impact margin. The library now has fork-free unit tests.
+- **The margin is load-bearing.** Without it the spot-and-fee estimate is so nearly exact (0.2bp)
+  that every fill came up short, hit the fallback and drained the position anyway, at 479k gas. All
+  tests still passed, because the D2 assertions encoded the old full-unwind behaviour. See
+  `JOURNAL.md`.
+- **Correction to this plan:** partial unwind *costs* ~18k gas (304k → 322k for a 5k fill). What it
+  buys is the maker's position surviving the fill. The common-case gas win is the buffer, which
+  landed on D1.
+- Dust-take defence verified: 20 consecutive dust takes never touch a position with a funded
+  buffer. It does require the buffer to be funded — a maker policy, not automatic.
+
 **Next, in order:**
-1. D3: partial unwind. The base's `shortfall`-shaped hook is already the right signature; the
-   adapter currently ignores it and burns everything.
-2. Fork `BlueBuyCallbackIntegrationTest` — deferred from D1 on purpose. It needs a real offer taken
+1. Fork `BlueBuyCallbackIntegrationTest` — deferred from D1 on purpose. It needs a real offer taken
    against real Midnight, which is now finally possible.
-3. Then D4 (v4 adapter) as scheduled.
+2. Then D4 (v4 adapter) as scheduled.
 
 **Open, needs a decision:** the repo has no root `LICENSE` file. The forked Morpho periphery is
 GPL-2.0-or-later, so the derivative is too; the file headers already say so but the repo does not.
@@ -82,7 +96,7 @@ The prep window (Mon 31 Aug → Thu 3 Sep) was not used. These are prerequisites
 |-----|-------------|
 | **D1** (Fri 4) | Public repo ✅, `FRICTION.log` started ✅, fork-Base harness green ✅. `UniswapBuyCallbackBase` skeleton + factory ✅. Blue's two unit suites forked ✅; the integration suite waits on the v3 adapter. |
 | **D2** (Sat 5) | **v3 happy path** ✅. Park in the NFT position; `onBuy` does `decreaseLiquidity` then `collect`, swaps residual, approves Midnight, returns `CALLBACK_SUCCESS`. 16 green fork tests; custody settled non-custodial. |
-| **D3** (Sun 6) | Loan-token buffer + partial unwind in the shared base. Only touch the LP when the buffer can't cover the fill. Fixes dust-grief bleed and common-case gas. |
+| **D3** (Sun 6) | Loan-token buffer ✅ (landed D1) + partial unwind ✅. Only touch the LP when the buffer can't cover the fill, and then only for the fill's share. Fixes dust-grief bleed; costs ~18k gas rather than saving it. |
 | **D4** (Mon 7) | **v4 happy path.** Whole unwind inside one `PoolManager.unlock()` — `modifyLiquidity`, swap residual, settle one netted delta. Naive `buyerAssetsBound` on both. |
 | **D5** (Tue 8) | `SourcingMathLib` single-step version — exact for the stable pool, where a small residual never leaves the active tick range. Include the `max_share` liquidity cap. |
 | **D6** (Wed 9) | Multi-tick walk (`TickBitmap` + `computeSwapStep`) for the volatile pool. Bisection on top. Cross-check against `bound.py` outputs. |
@@ -93,7 +107,7 @@ The prep window (Mon 31 Aug → Thu 3 Sep) was not used. These are prerequisites
 | Day | Deliverable |
 |-----|-------------|
 | **D8** (Fri 11) | The fix on v3: reference-relative bound in `onBuy` behind `IPriceRef`, first implementation `V3TwapRef`. Same D7 test, now reverting cleanly or filling honestly. |
-| **D9** (Sat 12) | Dust-take grief test — N repeated dust takes, bleed without the buffer, flat line with it. **Resolve the oracle licensing question today**, before D10 depends on it. |
+| **D9** (Sat 12) | Dust-take grief test — N repeated dust takes, bleed without the buffer, flat line with it. Also the decision point for a configured **minimum fill size**: deliberately skipped on D3 because the bleed is linear and the sourcing floor self-calibrates, so revisit only if the measured bleed contradicts that (see `JOURNAL.md`). **Resolve the oracle licensing question today**, before D10 depends on it. |
 | **D10** (Sun 13) | Port grief + fix to v4; add `TruncatedOracleRef` with a seeded oracle pool in-fork. Hook address mining. Run the D7 attack against both references. |
 | **D11** (Mon 14) | **The frontier chart** — sweep range width, plot fee APR against `buyerAssetsBound`. Plus gas benchmarks: v3 vs v4 vs `BlueBuyCallback`, buffer-hit and buffer-miss separately. |
 | **D12** (Tue 15) | README with script-generated claim → file → line table. `FEEDBACK.md` edited from `FRICTION.log`. |
