@@ -59,6 +59,10 @@ import {SourcingMathLib} from "./libraries/SourcingMathLib.sol";
 contract UniswapV3BuyCallback is UniswapBuyCallbackBase, IUniswapV3BuyCallback, IUniswapV3SwapCallback {
     using SafeCast for uint256;
 
+    /// @dev How far past the sized burn `_sourceLoanToken` may escalate when the estimate came up
+    /// short. See `_escalationCeiling`.
+    uint256 internal constant ESCALATION_FACTOR = 2;
+
     /// @dev Everything about the parked position that either half of the callback needs, read in
     /// one call. `positions` returns twelve values and only these seven are used.
     struct PositionState {
@@ -128,11 +132,18 @@ contract UniswapV3BuyCallback is UniswapBuyCallbackBase, IUniswapV3BuyCallback, 
         uint256 sourced = IERC20Extended(loanToken).balanceOf(address(this)) - heldBefore;
 
         // The sizing accounts for the swap fee but not yet for price impact, so it can come up
-        // short on a thin venue. Rather than fail a fill the position could actually have covered,
-        // unwind what is left and try once more. The worst case is the unconditional full unwind
-        // this replaced, and it is reached only when the estimate was optimistic.
-        if (sourced < shortfall && burn < position.liquidity) {
-            _unwind(tokenId, position.liquidity - burn);
+        // short on a thin venue. Escalate rather than fail a fill the position could have covered —
+        // but only within a bounded multiple of what the fill itself justified.
+        //
+        // The bound is the whole point. Escalating straight to the remaining liquidity means any
+        // fill too small to survive the rounding in `liquidityForTarget` unwinds the entire
+        // position: a take of one wei sizes to a burn that yields zero tokens, comes up short, and
+        // takes the maker's whole LP with it. Proportionality is the invariant — the liquidity
+        // burnt must stay tied to the size of the fill, and a fill that cannot justify its own
+        // sourcing has to fail closed instead.
+        uint256 ceiling = _escalationCeiling(burn, position.liquidity);
+        if (sourced < shortfall && ceiling > burn) {
+            _unwind(tokenId, uint128(ceiling - burn));
             _swapWholeResidual(residualToken, loanToken);
             sourced = IERC20Extended(loanToken).balanceOf(address(this)) - heldBefore;
         }
@@ -141,6 +152,15 @@ contract UniswapV3BuyCallback is UniswapBuyCallbackBase, IUniswapV3BuyCallback, 
         // a bare `transferFrom` failure — worth two warm balance reads in the contract whose whole
         // point is failing honestly rather than filling badly.
         require(sourced >= shortfall, InsufficientSourced());
+    }
+
+    /// @dev The most liquidity a fill may burn, given what the sizing said it needed. Twice the
+    /// sized burn: ample for the impact the 25bp margin failed to cover — that would have to be
+    /// eight times the margin before it bound — while keeping the burn proportional to the fill, so
+    /// a fill that cannot justify its own sourcing reverts rather than taking the position with it.
+    function _escalationCeiling(uint128 sized, uint128 available) internal pure returns (uint256) {
+        uint256 ceiling = uint256(sized) * ESCALATION_FACTOR;
+        return ceiling < available ? ceiling : available;
     }
 
     /// @dev How much of the position this fill needs. See `SourcingMathLib.liquidityForTarget` for

@@ -237,6 +237,46 @@ contract UniswapV3BuyCallbackTest is ForkBase {
         assertEq(burns, 1, "fell back to a second burn on the product venue");
     }
 
+    /// @dev The attack the escalation ceiling exists to stop. A fill of one wei sizes to a burn
+    /// that yields nothing once amounts round down, so it can never cover itself. Before the
+    /// ceiling, the fallback answered that by unwinding the whole position — a maker's entire LP
+    /// destroyed for a millionth of a dollar, in one transaction, with no capital at risk for the
+    /// attacker. It has to fail closed instead.
+    function test_aDustFillCannotUnwindThePosition() public {
+        uint128 liquidityBefore = _liquidity();
+
+        vm.expectRevert(IUniswapV3BuyCallback.InsufficientSourced.selector);
+        vm.prank(MIDNIGHT);
+        callback.onBuy(bytes32(0), market, 1, 0, 0, maker, _callbackData());
+
+        assertEq(_liquidity(), liquidityBefore, "a dust fill moved the position");
+    }
+
+    /// @dev The ceiling must not fire on honest fills. Sweeps sizes across four orders of
+    /// magnitude, each against a fresh position, asserting every one settles and none of them burns
+    /// disproportionately.
+    function test_honestFillsOfEverySizeStillSettle() public {
+        uint256[5] memory sizes = [uint256(1e6), 100e6, 1_000e6, 5_000e6, 15_000e6];
+
+        for (uint256 i; i < sizes.length; ++i) {
+            uint256 snapshot = vm.snapshotState();
+            uint128 liquidityBefore = _liquidity();
+
+            vm.prank(MIDNIGHT);
+            bytes32 result = callback.onBuy(bytes32(0), market, sizes[i], 0, 0, maker, _callbackData());
+
+            assertEq(result, CALLBACK_SUCCESS, "honest fill refused");
+            assertGe(IERC20Meta(USDC).balanceOf(address(callback)), sizes[i], "under-sourced");
+
+            // Burnt liquidity stays tied to the fill: never more than double the fill's share.
+            uint256 burnt = liquidityBefore - _liquidity();
+            uint256 fairShare = (uint256(liquidityBefore) * sizes[i]) / 19_800e6;
+            assertLe(burnt, fairShare * 2 + 1e6, "burnt disproportionately to the fill");
+
+            vm.revertToState(snapshot);
+        }
+    }
+
     /// @dev The dust-take defence, end to end. With a funded buffer, repeated small takes never
     /// reach the position at all — no burn, no swap, nothing to bleed.
     function test_repeatedDustTakesNeverTouchAFundedPosition() public {

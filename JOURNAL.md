@@ -532,3 +532,61 @@ So the buffer is a **maker policy**, not an automatic property, and the docs sho
 some idle loan token alongside the position or accept the bleed. Sizing that policy properly — how
 large a buffer for how much expected dust — is a question for the D9 grief test, which is where the
 bleed gets quantified.
+
+## 2026-09-05 (D3, same day) — A one-wei take could destroy the whole position
+
+Found while considering whether to add a maker-configured minimum fill size. The concern was the
+dust *bleed*; what turned up was a dust *kill*.
+
+A take of **1 wei of USDC** unwound a 10k+10k position completely: 3,981,161,161,854 liquidity to
+zero, the maker's entire LP converted to buffer. One transaction, a millionth of a dollar, no
+capital at risk for the attacker, and it defeats the whole of D3.
+
+The mechanism is the D3 fallback, not the per-fill cost. `liquidityForTarget` sizes a 1-wei target
+at 401 liquidity units; `getAmount0Delta` rounds down, so 401 units yields **zero** tokens; `sourced
+< shortfall` fires; and the fallback — written as "unwind whatever is left and try once more" —
+burns the remaining 3.98e12. The fallback's worst case was documented as "the full unwind D2 did
+unconditionally", which was true and completely missed that D2 only ever did that for a fill large
+enough to warrant it.
+
+The missing invariant is **proportionality**: liquidity burnt must stay tied to the size of the
+fill. `_escalationCeiling` now caps any fill's total burn at twice what the sizing said it needed.
+Impact would have to run to eight times the 25bp margin before that binds on an honest fill, while a
+fill too small to cover its own rounding now reverts `InsufficientSourced` and leaves the position
+untouched. Fail closed, which is the same answer this contract gives everywhere else.
+
+Two things worth keeping from how this was found:
+
+**The fallback was reasoned about in the wrong direction.** "Worst case equals the old behaviour"
+sounds like a safety argument and is not one, because it compares against the old behaviour under
+the *old* trigger conditions. The old full unwind fired for large fills; the new one fired for
+absurd ones. When a code path's trigger changes, the bound on its blast radius has to be re-derived,
+not inherited.
+
+**It came from taking a design suggestion seriously enough to test it.** The proposal was a
+configured minimum fill size, which is a plausible answer to a bleed. Probing whether the bleed was
+actually the problem is what surfaced a far worse bug sitting underneath it.
+
+## 2026-09-05 (D3, same day) — Why the fix is not a configured minimum fill size
+
+With the escalation ceiling in, the case for a maker-configured minimum is much weaker than it
+looked, and the reasons are worth recording before the idea comes back.
+
+**The per-fill economics are already linear.** After D3, a fill of size X burns proportionally and
+swaps roughly X/2 of residual at ~8.5bp. A thousand dust fills therefore cost the maker about what
+one fill of the same total costs. Price impact is convex, so many small swaps are, if anything,
+*cheaper* per unit than one large one. The superlinear bleed the D1 entry worried about was an
+artefact of the unconditional full unwind, and D3 removed it.
+
+**The floor is already there, and it self-calibrates.** A fill too small to source its own rounding
+reverts. That is a minimum, expressed in the only unit that actually matters — whether the fill can
+pay for its own execution — and it needs no constant, no config, and no guess about the right size.
+
+**A configured minimum has two real costs.** It strands the tail of a partially-filled offer: once
+the remainder falls below S, nobody can take it and the maker has to cancel and re-sign. And there
+is no channel to advertise it — `buyerAssetsBound` publishes a maximum, the callback interface has
+no minimum, so takers would discover S by having transactions revert. A generic Midnight routing
+layer would keep offering fills the offer will refuse.
+
+Not ruled out as a maker policy, but it is a product decision with a fillability cost, and it is no
+longer load-bearing for safety.
