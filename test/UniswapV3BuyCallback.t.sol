@@ -249,6 +249,67 @@ contract UniswapV3BuyCallbackTest is ForkBase {
         callback.onBuy(bytes32(0), market, 1e6, 0, 0, address(0xdead), _callbackData());
     }
 
+    /// FAIL-CLOSED ///
+
+    /// @dev A take larger than the position can source must revert, not settle badly. This is the
+    /// scenario `buyerAssetsBound` exists to stop a taker walking into: the routing layer is
+    /// asynchronous, so a taker can size a fill against stale state and ask for more than the maker
+    /// can actually produce. The bound says no first; `InsufficientSourced` is what catches it when
+    /// the taker ignores the bound.
+    function test_onBuyRevertsWhenTheWholePositionCannotCoverTheFill() public {
+        uint256 buyerAssets = 100_000e6;
+
+        // The bound is the taker's warning, and it is well below the ask.
+        assertLt(
+            callback.buyerAssetsBound(bytes32(0), market, maker, _callbackData()),
+            buyerAssets,
+            "bound should already refuse this size"
+        );
+
+        vm.expectRevert(IUniswapV3BuyCallback.InsufficientSourced.selector);
+        vm.prank(MIDNIGHT);
+        callback.onBuy(bytes32(0), market, buyerAssets, 0, 0, maker, _callbackData());
+    }
+
+    /// @dev Guards against a *future* tolerant implementation rather than against the EVM. A revert
+    /// rolls state back on its own, so this passes trivially today; it starts earning its place the
+    /// moment someone is tempted to make `_sourceLoanToken` source what it can and approve less,
+    /// which would half-settle a take and strand the difference on the callback.
+    function test_failedFillLeavesThePositionIntact() public {
+        uint128 liquidityBefore = _liquidity();
+
+        vm.expectRevert(IUniswapV3BuyCallback.InsufficientSourced.selector);
+        vm.prank(MIDNIGHT);
+        callback.onBuy(bytes32(0), market, 100_000e6, 0, 0, maker, _callbackData());
+
+        assertEq(_liquidity(), liquidityBefore, "position was drained by a failed take");
+        assertEq(IERC20Meta(USDC).allowance(address(callback), MIDNIGHT), 0, "Midnight left approved");
+        assertEq(IERC20Meta(USDC).balanceOf(address(callback)), 0, "loan token stranded on the callback");
+        assertEq(IERC20Meta(USDT).balanceOf(address(callback)), 0, "residual stranded on the callback");
+    }
+
+    /// @dev A maker can sign an offer whose routing pool does not trade the residual against the
+    /// loan token — here a USDC/USDT position routed through cbBTC/USDC, where the USDT residual
+    /// has no counterparty. Since the route venue is immutable this is a deployment-time mistake,
+    /// and it must revert on a name rather than attempt the swap.
+    function test_onBuyRevertsIfTheRouteVenueCannotTradeTheResidual() public {
+        UniswapV3BuyCallback misrouted = UniswapV3BuyCallback(
+            factory.createCallback(maker, priceRef, MAX_SLIPPAGE_WAD, POOL_CBBTC_USDC_500, bytes32(uint256(2)))
+        );
+
+        // cbBTC/USDC holds the loan token but not the residual, so the mismatch is specifically
+        // about the residual having nowhere to go.
+        assertEq(IUniswapV3Pool(POOL_CBBTC_USDC_500).token0(), USDC, "route pool token0");
+        assertEq(IUniswapV3Pool(POOL_CBBTC_USDC_500).token1(), CBBTC, "route pool token1");
+
+        vm.prank(maker);
+        INonfungiblePositionManager(V3_POSITION_MANAGER).approve(address(misrouted), tokenId);
+
+        vm.expectRevert(IUniswapV3BuyCallback.RoutePairMismatch.selector);
+        vm.prank(MIDNIGHT);
+        misrouted.onBuy(bytes32(0), market, 5_000e6, 0, 0, maker, _callbackData());
+    }
+
     /// @dev Approval is the maker's to revoke, and revoking it under a live offer breaks their own
     /// offer rather than anyone else's. It fails closed.
     function test_onBuyRevertsIfApprovalIsRevoked() public {
