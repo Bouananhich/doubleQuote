@@ -51,9 +51,16 @@ already been considered and rejected there for stated reasons.
 ## Build
 
 ```shell
+cp .env.example .env   # optional, set BASE_RPC_URL
 forge build
 forge test
 ```
+
+The whole suite forks Base at a pinned block. `forge` auto-loads `.env`; `BASE_RPC_URL` is
+optional and falls back to the public `https://mainnet.base.org` when unset **or empty** (a
+missing GitHub secret expands to empty, hence the explicit empty check in
+`ForkBase._baseRpcUrl`). `.env` is gitignored — this repo is public, so a private endpoint goes
+in `.env` locally and in a repo secret for CI, never in `foundry.toml`.
 
 Targeting solc **0.8.34** / **osaka** evm, following Midnight. Tests are **fork-first against
 Base**, binding already-deployed Midnight, v3 and v4 contracts **through interfaces only** — that
