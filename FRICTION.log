@@ -32,3 +32,37 @@ part that makes the feedback actionable and the part that is impossible to recon
     factory.feeAmountTickSpacing(500) == 10. That worked and is arguably better practice, but it
     is a verification step every integrator repeats from scratch.
     (cost: ~15m)
+
+2026-09-05 --:--  [v4-core/v4-periphery]  LiquidityAmounts is not where you need it.
+    Expected to compute token amounts from a position's liquidity using LiquidityAmounts, which is
+    what every guide and every v3 integration uses. It is in v4-PERIPHERY, not v4-core. Taking a
+    periphery dependency to get one pure function that touches no protocol state was not worth it,
+    so composed it by hand from SqrtPriceMath.getAmount0Delta/getAmount1Delta plus the three
+    range cases. That is ~15 lines that exist in Uniswap's own repos twice already.
+    The split is defensible for contracts; it is odd for pure math with no protocol dependency.
+    (cost: ~20m, mostly deciding whether to take the dependency)
+
+2026-09-05 --:--  [v4-core]  v3->v4 constant rename with no migration note found.
+    Expected v3's MIN_SQRT_RATIO/MAX_SQRT_RATIO in v4's TickMath. They are MIN_SQRT_PRICE and
+    MAX_SQRT_PRICE. Values and tick range are identical, so v4's TickMath is safe to point at a v3
+    pool -- which is exactly what this project does, since v3's own libraries are pinned to =0.7.6
+    and cannot be compiled alongside it. Had to diff the constants by hand to establish that it
+    was a rename and not a semantic change. A one-line note in either repo would have covered it.
+    (cost: ~10m)
+
+2026-09-05 --:--  [tooling]  adding v4-core silently repointed an existing remapping.
+    Expected `forge remappings` to gain v4-core entries. It also moved `ds-test/` from
+    lib/midnight/lib/morpho-blue/lib/forge-std/... to lib/v4-core/lib/forge-std/... Nothing broke,
+    but a transitive dependency of a newly added submodule quietly rebinding a remapping that an
+    existing dependency relies on is a real hazard in a multi-submodule project.
+    Also worth noting the shape inconsistency it creates: forge generates `v4-core/=lib/v4-core/src/`
+    but `midnight/=lib/midnight/`, so imports read `v4-core/libraries/X.sol` next to
+    `midnight/src/libraries/X.sol`. Cost one failed build to notice.
+    (cost: ~10m)
+
+2026-09-05 --:--  [v3-periphery]  positions() returns twelve values.
+    Expected to read a position's ticks and liquidity. INonfungiblePositionManager.positions
+    returns a 12-tuple with no struct, so every call site is a line of anonymous commas where a
+    miscount compiles fine and reads the wrong field. Wrapped it in a local struct immediately.
+    Not a blocker, but it is the kind of thing that makes an integration bug silent.
+    (cost: ~5m)

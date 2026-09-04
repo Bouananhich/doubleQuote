@@ -4,3 +4,6 @@
 [submodule "lib/midnight"]
 	path = lib/midnight
 	url = https://github.com/morpho-org/midnight
+[submodule "lib/v4-core"]
+	path = lib/v4-core
+	url = https://github.com/Uniswap/v4-core

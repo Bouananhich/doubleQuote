@@ -18,17 +18,28 @@ parking; CI green. Plus, second half of D1:
 - The buffer landed early, in the base rather than at D3 — it fixes the signature of
   `_sourceLoanToken` (shortfall, not total), which both adapters implement.
 
-**Next, in order:**
-1. D2 as scheduled: `UniswapV3BuyCallback` + `UniswapV3BuyCallbackFactory`, filling in
-   `_sourceLoanToken` / `_sourceableBound`, and the `InconsistentLoanToken` analogue, which lives in
-   the adapter rather than the base.
-2. Settle the custody leaning while writing it (see `JOURNAL.md`, "Leaning: the maker keeps custody
-   of the position").
-3. Fork `BlueBuyCallbackIntegrationTest` — deferred from D1 on purpose. It needs a real offer taken
-   against real Midnight, so it only becomes writable once the v3 adapter exists.
+## D2 — done
 
-**Not blocking:** `bound.py` is present (277 lines) but **untracked**, which is why D1 first read it
-as missing. Commit it — the D5/D6 cross-check depends on it being in the repo.
+`UniswapV3BuyCallback` + `UniswapV3BuyCallbackFactory`, green against a real position minted in the
+real USDC/USDT 0.01% pool on the Base fork. **52/52** suite-wide.
+
+- **Custody settled, non-custodial.** The maker keeps the NFT and approves the callback for the
+  `tokenId`; `ownerOf` is asserted unchanged *after* a full unwind. The D1 leaning is confirmed,
+  not reversed.
+- **`lib/v4-core` added** for `SqrtPriceMath` / `TickMath` / `FullMath`, all `^0.8.0`, none of them
+  reaching the `0.8.26`-pinned `PoolManager`. Still one compiler profile. `SourcingMathLib` seeded
+  with the naive bound.
+- **Measured:** a 10k+10k position unwinds to 19,871.46 USDC; the residual swap costs 8.5bp, 1bp of
+  which is the pool fee. That is the number D8 has to beat.
+- Park and route proven independent — a callback routing through cbBTC/USDC rejects a swap callback
+  from the pool its position is parked in.
+
+**Next, in order:**
+1. D3: partial unwind. The base's `shortfall`-shaped hook is already the right signature; the
+   adapter currently ignores it and burns everything.
+2. Fork `BlueBuyCallbackIntegrationTest` — deferred from D1 on purpose. It needs a real offer taken
+   against real Midnight, which is now finally possible.
+3. Then D4 (v4 adapter) as scheduled.
 
 **Open, needs a decision:** the repo has no root `LICENSE` file. The forked Morpho periphery is
 GPL-2.0-or-later, so the derivative is too; the file headers already say so but the repo does not.
@@ -70,7 +81,7 @@ The prep window (Mon 31 Aug → Thu 3 Sep) was not used. These are prerequisites
 | Day | Deliverable |
 |-----|-------------|
 | **D1** (Fri 4) | Public repo ✅, `FRICTION.log` started ✅, fork-Base harness green ✅. `UniswapBuyCallbackBase` skeleton + factory ✅. Blue's two unit suites forked ✅; the integration suite waits on the v3 adapter. |
-| **D2** (Sat 5) | **v3 happy path.** Park in the NFT position; `onBuy` does `decreaseLiquidity` then `collect`, swaps residual, approves Midnight, returns `CALLBACK_SUCCESS`. One green fork test. |
+| **D2** (Sat 5) | **v3 happy path** ✅. Park in the NFT position; `onBuy` does `decreaseLiquidity` then `collect`, swaps residual, approves Midnight, returns `CALLBACK_SUCCESS`. 16 green fork tests; custody settled non-custodial. |
 | **D3** (Sun 6) | Loan-token buffer + partial unwind in the shared base. Only touch the LP when the buffer can't cover the fill. Fixes dust-grief bleed and common-case gas. |
 | **D4** (Mon 7) | **v4 happy path.** Whole unwind inside one `PoolManager.unlock()` — `modifyLiquidity`, swap residual, settle one netted delta. Naive `buyerAssetsBound` on both. |
 | **D5** (Tue 8) | `SourcingMathLib` single-step version — exact for the stable pool, where a small residual never leaves the active tick range. Include the `max_share` liquidity cap. |

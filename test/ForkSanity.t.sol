@@ -3,14 +3,10 @@ pragma solidity 0.8.34;
 
 import {IMidnight} from "midnight/src/interfaces/IMidnight.sol";
 
+import {INonfungiblePositionManager, IUniswapV3Factory, IUniswapV3Pool} from "../src/interfaces/IUniswapV3.sol";
+
 import {ForkBase} from "./ForkBase.sol";
-import {
-    IERC20Meta,
-    INonfungiblePositionManager,
-    IPositionManagerV4,
-    IUniswapV3Factory,
-    IUniswapV3Pool
-} from "./interfaces/IUniswapMinimal.sol";
+import {IERC20Meta, IPositionManagerV4} from "./interfaces/IUniswapMinimal.sol";
 
 /// @dev Exercises `clz` (Osaka) so the fork EVM is proven to execute it, not just assumed to.
 /// Midnight relies on it in `UtilsLib.mostSignificantBit`, and the whole build follows Midnight's

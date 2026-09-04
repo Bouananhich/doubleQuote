@@ -381,3 +381,78 @@ available" — not as zero.
 No staleness or window accessor on the interface. Those are properties of a reference, configured at
 its deployment, and the callback has no decision to make with them; the D11 comparison table can
 read them off each implementation directly.
+
+## 2026-09-05 (D2) — Custody settled: non-custodial, as the D1 leaning guessed
+
+The maker keeps the position NFT and `approve`s the callback for the `tokenId`. Confirmed by
+building it rather than by reading: `decreaseLiquidity` gates only on
+`_isApprovedOrOwner(msg.sender, tokenId)`, and `collect` takes an arbitrary `recipient`, so the
+entire unwind runs with the NFT never leaving the maker's wallet. `ownerOf(tokenId)` is asserted to
+still be the maker *after* a full unwind, so the property is tested rather than assumed.
+
+The D1 entry can be read as confirmed, not reversed. The base needs no owner-withdraw path, no
+rescue hatch, and no ERC-721 receiver — and the maker's escape hatch is the one they already had,
+which is the position manager itself.
+
+Revoking approval under a live offer breaks the maker's own offer and nobody else's; the take
+reverts when the tokens fail to arrive. There is a test for that too, because "fails closed" is a
+claim worth holding to.
+
+## 2026-09-05 (D2) — v4-core is the math dependency, even for the v3 adapter
+
+Added `lib/v4-core` and took `SqrtPriceMath`, `TickMath`, `FullMath`, `SafeCast` and `FixedPoint96`
+from it. All are `^0.8.0`, all compile at 0.8.34/osaka, and none of them transitively reach
+`PoolManager.sol` — which is the file pinned to exactly `0.8.26` and the reason the whole project
+binds Uniswap through interfaces. Verified by compiling a throwaway probe before writing anything
+that depends on it, because "the libraries are probably fine" is how a second compiler profile gets
+into a project.
+
+Two things had to be checked by hand rather than assumed:
+
+- v4 renamed the swap-limit constants. `MIN_SQRT_RATIO` / `MAX_SQRT_RATIO` in v3 are
+  `MIN_SQRT_PRICE` / `MAX_SQRT_PRICE` in v4. The *values* are identical (`4295128739` and
+  `1461446…970342`, tick range ±887272), so v4's `TickMath` is safe to point at a v3 pool. That is
+  a rename, not a semantic change, but nothing says so.
+- **`LiquidityAmounts` is not in v4-core.** It lives in v4-periphery, which this project does not
+  want as a dependency. `SourcingMathLib.amountsForLiquidity` composes the same result from
+  `SqrtPriceMath.getAmount0Delta` / `getAmount1Delta` and the three range cases directly.
+
+`SourcingMathLib` now exists, holding the *naive* bound only — position amounts at spot plus the
+residual converted at spot, no price impact and no fee. It is knowingly an over-estimate, and the
+size of that error is the subject of D5/D6.
+
+## 2026-09-05 (D2) — Swap the whole residual, not just what the fill needs
+
+`_sourceLoanToken` could swap exact-output for precisely the shortfall and leave the rest of the
+residual sitting on the callback. It swaps the entire residual instead.
+
+Two reasons. The surplus lands in the **buffer**, which is exactly where surplus loan token wants
+to be — the next fill is then served without touching the LP at all, which is the dust-take defence
+paying for itself. And no residual dust ever accumulates: a callback that holds three tokens is a
+callback somebody has to remember to `skim`.
+
+Verified end-to-end on the fork. A 10k+10k USDC/USDT position, unwound in full, collects
+**9,879.99 USDC + 9,999.99 USDT** and the residual swap returns **9,991.47 USDC** — a round-trip
+cost of **8.53 USDC, about 8.5bp**, of which 1bp is the pool fee and the rest is the pool's offset
+from parity plus impact. Total recovered: 19,871.46 USDC.
+
+That 8.5bp is the number D8 has to beat, and D7 is the test that shows what it becomes when
+somebody moves the pool first.
+
+## 2026-09-05 (D2) — What D2 deliberately does not do
+
+Recorded so the gaps read as scheduled rather than missed. Both are called out in the contract's
+own natspec:
+
+1. **The unwind is total.** `_sourceLoanToken` burns the whole position whatever the fill size.
+   Safe, and it throws away the yield leg on the first non-buffered take. Partial unwind is D3, and
+   the base's `shortfall`-shaped hook already has the right signature for it.
+2. **The residual swap has no price protection at all** — no `minOut`, sqrt-price limit at the
+   extremes. `PRICE_REF` and `MAX_SLIPPAGE_WAD` are held as immutables and not read. This is not an
+   oversight to fix quietly: D7's griefing test needs an unprotected version to attack so the cost
+   can be *quantified*, and D8 then adds the reference-relative bound and re-runs the same test.
+
+`amount0Min` / `amount1Min` are zero on the burn, and that one *is* correct rather than pending.
+Removing liquidity leaves `sqrtP` unchanged, so there is no burn slippage to protect against. What
+the burn does is thin the book the residual is about to be swapped into — finding A — and that
+lands on the swap, which is where D8's protection goes.
