@@ -2,6 +2,23 @@
 
 Two build weeks: **Fri 4 Sep → Fri 18 Sep 2026**. D1 is Fri 4 Sep.
 
+## Where things stand — end of D1
+
+**Done:** public repo; `FRICTION.log` running; fork-Base harness green on a **single compiler
+profile** (8/8, solc 0.8.34 / evm osaka, Base pinned at block 50,875,000); all Midnight and
+Uniswap addresses verified on-chain; both parking venues chosen and pinned; FairFlow cleared for
+parking; CI green.
+
+**Next, in order:**
+1. `UniswapBuyCallbackBase` skeleton + CREATE2 factory, forked from
+   `lib/midnight/src/periphery/blue-buy-callback/` (GPL-2.0, safe to fork — core is BUSL-1.1 and
+   must not be vendored).
+2. Fork the three Blue callback tests into `UniswapBuyCallback*`.
+3. Then D2 as scheduled.
+
+**Blocking nothing yet, but needed by D5:** `bound.py` does not exist. It has to be written from
+the spec in `JOURNAL.md` ("The bound math", plus findings A and B).
+
 Build order is **v3 first, v4 second, both shipped**. v3 is load-bearing — its native
 `observe()` makes the price-reference work straightforward. If a day goes missing, v4 is cut,
 never v3.
@@ -57,6 +74,31 @@ The prep window (Mon 31 Aug → Thu 3 Sep) was not used. These are prerequisites
 | **D12** (Tue 15) | README with script-generated claim → file → line table. `FEEDBACK.md` edited from `FRICTION.log`. |
 | **D13** (Wed 16) | Demo: park → yield accruing → taker fills → atomic unwind + settle in one tx, both venues, then the sandwich contrast. **Submit the Uniswap Developer Feedback Form today.** |
 | **D14** (Thu 17) | Buffer. It will be needed. |
+
+---
+
+## Open decisions
+
+### The Graph as a routing layer — undecided, costs a day
+
+Full reasoning in `JOURNAL.md` (2026-09-04, "The Graph: routing layer, not `IPriceRef`").
+Settled part: **it cannot back `IPriceRef`** and that is not reopenable — a subgraph is
+unreachable from an `external view`, and bridging it via Chainlink would add exactly the
+push-oracle trust assumption the sandwich demo exists to attack. `V3TwapRef` stays the production
+reference.
+
+Open part: whether to build a subgraph as the **taker-side routing layer**. It is on-thesis —
+Morpho's own `buyerAssetsBound` docstring says takers get their amount from a routing layer that is
+"asynchronous/offchain, and might not be up to date", and the bound exists to cap against it. The
+project currently has no routing layer, so the demo only shows the settlement half. It is also
+the natural home for the D11 frontier chart and for the historical yield accrual that risk #6 says
+cannot be shown live. Qualifies for a second hackathon track.
+
+Cost is roughly one day (subgraph + thin query layer). **If taken, it comes out of either the v4
+adapter or the `TruncatedOracleRef` comparison — decide which before starting, not during.**
+Ranked preference if forced to choose: cut `TruncatedOracleRef` first (risk #3 already says to
+timebox the oracle work and cut from the right), keep v4, since the v3-vs-v4 gas table is the
+artifact aimed squarely at a Uniswap judge.
 
 ---
 
