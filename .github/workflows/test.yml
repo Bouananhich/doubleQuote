@@ -34,5 +34,19 @@ jobs:
       - name: Run Forge build
         run: forge build --sizes
 
+      # The whole suite forks Base. Caching the RPC responses keeps repeat runs off the network:
+      # without it every job re-fetches the same state at the pinned block, which is slow and
+      # invites rate limiting when falling back to the public endpoint.
+      - name: Cache RPC responses
+        uses: actions/cache@v4
+        with:
+          path: ~/.foundry/cache/rpc
+          key: rpc-base-50875000-${{ hashFiles('test/ForkBase.sol') }}
+          restore-keys: rpc-base-50875000-
+
       - name: Run Forge tests
+        env:
+          # Optional. Unset (or empty, which is what a missing secret expands to) falls back to
+          # the public Base endpoint — see ForkBase._baseRpcUrl.
+          BASE_RPC_URL: ${{ secrets.BASE_RPC_URL }}
         run: forge test -vvv

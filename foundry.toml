@@ -15,6 +15,12 @@ bytecode_hash = "none"
 # compiled from source, which keeps this to a single compiler profile despite v3 being
 # pinned at 0.7.6 and v4's PoolManager/PositionManager at exactly 0.8.26.
 
+# Inherits profile.default. Declared because the CI workflow sets FOUNDRY_PROFILE=ci, which
+# otherwise warns and silently falls back.
+[profile.ci]
+fuzz = { runs = 1000 }
+verbosity = 3
+
 [fmt]
 line_length = 120
 wrap_comments = true

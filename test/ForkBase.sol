@@ -42,6 +42,14 @@ abstract contract ForkBase is Test {
     address internal constant POOL_USDC_USDT_100 = 0xD56da2B74bA826f19015E6B7Dd9Dae1903E85DA1;
 
     function setUp() public virtual {
-        vm.createSelectFork(vm.envOr("BASE_RPC_URL", string(DEFAULT_BASE_RPC)), FORK_BLOCK);
+        vm.createSelectFork(_baseRpcUrl(), FORK_BLOCK);
+    }
+
+    /// @dev Falls back to the public endpoint when `BASE_RPC_URL` is unset *or empty*. The empty
+    /// case is not hypothetical: GitHub Actions expands a missing secret to an empty string, which
+    /// `vm.envOr` treats as set, so a plain `envOr` would hand `createSelectFork` an empty URL.
+    function _baseRpcUrl() internal view returns (string memory url) {
+        url = vm.envOr("BASE_RPC_URL", string(""));
+        if (bytes(url).length == 0) url = DEFAULT_BASE_RPC;
     }
 }
