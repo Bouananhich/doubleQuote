@@ -208,3 +208,71 @@ the address is now hardcoded in `ForkBase.sol` and the provenance should be audi
 **Open gap:** `bound.py` — described in the design notes as written and validated on 31 Aug — is
 not in this repo. D5 and D6 both cross-check the Solidity against its outputs. It needs recovering
 or rewriting before then.
+
+## 2026-09-04 (D1) — FairFlow verified: green light on parking, red flag on routing
+
+Both halves of the prediction confirmed, from the hook's **address bits** rather than Kyber's
+marketing. FairFlow on Base is `UniswapV4KEMHook` at
+`0x4440854B2d02C57A0Dc5c58b7A884562D875c0c4` (~10KB deployed; same CREATE2 address on Arbitrum).
+
+Low 14 bits of the address are `0x00C4` → `beforeSwap`, `afterSwap`, `afterSwapReturnsDelta`, and
+nothing else.
+
+- **Green light.** `beforeRemoveLiquidity` (bit 9) is **not set**. The hook cannot gate
+  `modifyLiquidity` at all — it is a swap-only hook. Parking and unwinding are unaffected. This
+  could have killed the idea outright and it does not.
+- **Red flag confirmed.** `Uniswap/hooklist` records `requiresCustomSwapData: true`,
+  `swapAccess: "other"`, and describes it as enforcing *"signed quotes for exact-input swaps. Each
+  swap requires hookData containing a valid signature from an authorized quoteSigner."* A callback
+  cannot produce that signature atomically, so routing the residual through this pool is
+  impossible.
+
+Cross-checked three ways and all three agree: hand-decoded address bits, the hooklist registry
+entry, and Kyber's own description. **Park / route / reference stays as three separate venues.**
+
+## 2026-09-04 (D1) — `Uniswap/hooklist` partially answers the "which pools are usable" complaint
+
+`Uniswap/hooklist` is a public registry of v4 hook deployments recording all 14 permission bits
+plus `swapAccess` (`none` / `temporal` / `allowlist` / `governance` / `other`),
+`requiresCustomSwapData`, `vanillaSwap`, `dynamicFee` and `upgradeable`. That is very close to the
+exact data the design notes complained was unavailable, so FEEDBACK item #3 has been rewritten
+rather than dropped: the registry is off-chain, opt-in, and explicitly **not** the routing
+allowlist (that is a separate HubSpot form), so a contract still cannot ask "is this pool usable
+for X" at execution time.
+
+**The asymmetry is now measured, not hypothesised.** Of 161 Base hooks in the registry:
+
+| | count |
+|---|---|
+| park-friendly but route-hostile (`beforeRemoveLiquidity` unset, swap gated) | **45 (28%)** |
+| route-friendly but park-hostile (swap open, `beforeRemoveLiquidity` set) | 10 |
+| gate `beforeRemoveLiquidity` at all | 26 |
+| `requiresCustomSwapData` | 29 |
+
+28% is the number that justifies the design rule. A maker's best parking venue being unusable as a
+routing venue is the common case on Base, not an edge case discovered via one Kyber pool.
+
+**Also found:** `BackGeoOracle` (`0x59f3…bac4`, Base) is a TWAP oracle hook — but it sets
+`beforeRemoveLiquidity`, so it is park-hostile. It is a *reference* candidate only, which is
+itself a clean illustration of the three-venue split. Note it backruns swaps and credits surplus
+as ERC-6909, so it has its own MEV logic; treat its TWAP with suspicion before adopting.
+
+## 2026-09-04 (D1) — The Graph: routing layer, not `IPriceRef`
+
+Considered using a subgraph as the price reference. **Rejected for that role, adopted for another.**
+
+It cannot back `IPriceRef`. `buyerAssetsBound` is `external view` executing in the EVM; a subgraph
+is off-chain GraphQL and unreachable from it. Bridging via Chainlink would turn the reference into
+a *push* oracle with an added trust assumption — and the failure mode is not theoretical, since
+the April 2026 KelpDAO incident (~$290M) came from manipulated RPC infrastructure feeding exactly
+that kind of verification layer. Using an indexed off-chain feed as the manipulation-resistant
+reference in a design whose headline demo *is* a price-manipulation attack would be
+self-defeating. `V3TwapRef` stays the production path.
+
+Where it does fit is the half of the story currently missing entirely. Morpho's own docstring on
+`buyerAssetsBound` says takers get their per-offer amount from a routing layer that is
+"asynchronous/offchain, and might not be up to date on the chain's latest state", and that
+`buyerAssetsBound` exists so takers can cap against it. **That routing layer is subgraph-shaped**:
+index Midnight offers, surface each maker's depth-aware bound, let a taker size a fill. Building it
+makes the demo show the whole loop instead of just the settlement half, and it is the natural home
+for the D11 frontier chart and the historical yield accrual that risk #6 says cannot be shown live.

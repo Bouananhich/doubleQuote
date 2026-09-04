@@ -19,8 +19,10 @@ The prep window (Mon 31 Aug → Thu 3 Sep) was not used. These are prerequisites
 - [x] **Confirm Base supports the Osaka opcodes** Midnight relies on (`clz`) at the fork block.
       Midnight is deployed and live on Base compiled at osaka, and `clz` is exercised directly in
       the fork by `ClzProbe` in `test/ForkSanity.t.sol`.
-- [ ] **Verify FairFlow's hook permission bits** exclude `beforeRemoveLiquidity`. Five minutes,
-      and the venue choice rests on it.
+- [x] **Verify FairFlow's hook permission bits** exclude `beforeRemoveLiquidity`. Confirmed from
+      the address bits (`0x00C4` = `beforeSwap`, `afterSwap`, `afterSwapReturnsDelta` only), the
+      `Uniswap/hooklist` entry, and Kyber's own description. Parking is ungated; routing through it
+      is impossible (signed `quoteSigner` quotes). Park/route/reference stay separate.
 - [ ] **Read:** Midnight whitepaper, `take()` lines 363–500, `BlueBuyCallbackIntegrationTest.sol`
       end to end. *(Partial: `BlueBuyCallback.sol`, `ICallbacks.sol` and the `Market` struct read
       and confirmed against the design notes. Whitepaper and `take()` outstanding.)*

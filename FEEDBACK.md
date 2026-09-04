@@ -40,18 +40,40 @@ full-range tick spacing with liquidity **permanently locked**.
 An empty oracle pool is worse than no oracle. For any integration that needs a reference price and
 isn't itself a major venue, this is a hard blocker, and the practical answer is "keep reading v3".
 
-## 3. A hooked pool can be excellent to park in and unusable to route through
+## 3. A hooked pool can be excellent to park in and unusable to route through, and a contract cannot ask which
 
-*Status: to verify.*
+*Status: confirmed, and partly already solved off-chain.*
 
-Nothing in the integration surface distinguishes these. A hook may leave `modifyLiquidity`
-completely ungated while gating `swap` behind a signed off-chain quote that a contract cannot
-produce atomically — so the pool is a perfectly good place to hold a position and an impossible
-place to execute against.
+A hook may leave `modifyLiquidity` completely ungated while gating `swap` behind a signed
+off-chain quote a contract cannot produce atomically — so the pool is a perfectly good place to
+**hold** a position and an impossible place to **execute** against. Concretely, KyberSwap's
+FairFlow hook on Base (`0x4440854B…D875c0c4`) has low-14 address bits `0x00C4`: `beforeSwap`,
+`afterSwap`, `afterSwapReturnsDelta` and nothing else. Liquidity operations are untouched; every
+swap needs a `quoteSigner` signature in `hookData`.
 
-We only discovered this by reading a specific hook's marketing and then its permission bits.
-Discovering a pool's *usability profile* — not just its permission bitmap, but which operations a
-contract integrator can actually reach — currently requires reading the hook's source.
+**Credit where due: `Uniswap/hooklist` already records this**, and it was the fastest way to
+answer the question. Its schema carries all 14 permission bits plus `swapAccess`
+(`none`/`temporal`/`allowlist`/`governance`/`other`), `requiresCustomSwapData`, `vanillaSwap`,
+`dynamicFee` and `upgradeable`. That is close to exactly the right vocabulary.
+
+The gap that remains is that this is **off-chain, opt-in, and not the routing allowlist** (the
+registry README explicitly says inclusion does not imply routing allowlisting, which is a separate
+form). An integrating *contract* still cannot ask "can I route through this pool" at execution
+time, and must instead hard-code an answer its deployer looked up by hand.
+
+The asymmetry is common enough to be worth first-class support. Of the **161 Base hooks** in the
+registry:
+
+| | count |
+|---|---|
+| park-friendly but route-hostile (`beforeRemoveLiquidity` unset, swap gated) | **45 (28%)** |
+| route-friendly but park-hostile | 10 |
+| gate `beforeRemoveLiquidity` at all | 26 |
+| require custom swap data | 29 |
+
+Suggestion: expose the `swapAccess` / `requiresCustomSwapData` distinction on-chain — a view on the
+hook, or a standard interface hooks can implement — so integrators can check it atomically rather
+than trusting a snapshot taken at deployment time.
 
 ## 4. Pragma pinning forces multi-profile builds
 
