@@ -1,0 +1,16 @@
+# FRICTION.log
+
+Running log of everything that costs time while building against Uniswap. One entry per incident,
+appended when it happens — this file is the raw material `FEEDBACK.md` is edited down from.
+
+Format:
+
+    YYYY-MM-DD HH:MM  [area]  what I expected -> what actually happened  (cost: Xm)
+
+`area` is the surface, e.g. v4-core, v4-periphery, v3-periphery, quoter, hooks, docs, tooling.
+Record the expectation before the outcome; "I assumed X was true because the docs say Y" is the
+part that makes the feedback actionable and the part that is impossible to reconstruct later.
+
+---
+
+2026-09-04 09:00  [meta]  log started at D1, per plan.
