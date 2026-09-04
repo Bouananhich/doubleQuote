@@ -37,11 +37,18 @@ jobs:
       # The whole suite forks Base. Caching the RPC responses keeps repeat runs off the network:
       # without it every job re-fetches the same state at the pinned block, which is slow and
       # invites rate limiting when falling back to the public endpoint.
+      #
+      # The key deliberately varies per run. actions/cache only writes a new entry when the key
+      # *missed*, so a key derived from source files would go stale the moment a test touched
+      # state the cache did not already hold: the exact key still hits, nothing new is saved, and
+      # every subsequent run re-fetches the same additions. Adding the v3 adapter, which mints,
+      # burns and swaps on the fork, is exactly that case. A run-unique key with a shared prefix
+      # restores the newest cache and always saves the superset back.
       - name: Cache RPC responses
         uses: actions/cache@v4
         with:
           path: ~/.foundry/cache/rpc
-          key: rpc-base-50875000-${{ hashFiles('test/ForkBase.sol') }}
+          key: rpc-base-50875000-${{ github.run_id }}
           restore-keys: rpc-base-50875000-
 
       - name: Run Forge tests

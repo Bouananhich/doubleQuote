@@ -276,3 +276,183 @@ Where it does fit is the half of the story currently missing entirely. Morpho's 
 index Midnight offers, surface each maker's depth-aware bound, let a taker size a fill. Building it
 makes the demo show the whole loop instead of just the settlement half, and it is the natural home
 for the D11 frontier chart and the historical yield accrual that risk #6 says cannot be shown live.
+
+## 2026-09-04 (D1) — `bound.py` recovered
+
+The gap flagged this morning is closed: `bound.py` is present at the repo root, 277 lines, but
+**untracked**, which is why it read as missing. Committing it is what makes the D5/D6 cross-check
+reproducible rather than a local artefact. No rewrite needed.
+
+## 2026-09-04 (D1) — What `UniswapBuyCallbackBase` owns, and four divergences from Blue
+
+`BlueBuyCallback` is the closest thing Midnight has to a reference implementation, so the base was
+forked from its shape rather than written fresh. Four places where the fork deliberately parts
+company, each because parking in an LP position is not parking in a vault:
+
+**1. No `setAuthorization` / `setAuthorizationWithSig`.** Eleven of Blue's contract's ~120 lines and
+eleven of its tests exist to let accounts act on the callback's *Blue* position — the callback holds
+supply shares, so somebody has to be able to move them. Dropped whole. There is nothing to
+authorise: the leaning (see below) is that the maker never hands the position over.
+
+**2. `skim` is owner-only.** Blue's is permissionless because Blue's callback holds no idle balance,
+so sweeping it to the owner cannot hurt anybody. Ours holds the buffer. A permissionless `skim`
+would let anyone empty it for the price of one call, immediately before a take, forcing the LP
+unwind path — which is *exactly* the dust-take bleed the buffer exists to stop, re-entered through
+the front door. Cheapest possible fix, and the tradeoff is losing keeper-sweeps of rewards.
+
+**3. `buyerAssetsBound` returns 0 for any buyer but `OWNER`.** Blue's docstring says it ignores
+static reasons the bound might be smaller — wrong loan token, wrong owner — and leaves them to the
+routing layer. Reasonable when the bound is a balance lookup; less so when the bound is the
+headline output. A non-zero bound for an offer that reverts on take is a wrong answer, and one
+comparison in a gas-free `view` is not worth saving.
+
+**4. The buffer is in the base from the start, not bolted on at D3.** It is three lines
+(`balanceOf`, compare, source the difference) and it fixes the shape of the abstract hook:
+`_sourceLoanToken` takes a *shortfall*, not a total. Discovering that at D3 would have meant
+changing the one signature both adapters implement.
+
+What stayed identical: the two guards (`msg.sender == MIDNIGHT`, `buyer == OWNER`), the
+`safeApprove`-then-return-`CALLBACK_SUCCESS` tail, and *not* re-checking that the tokens arrived —
+Midnight checks that after the callback returns, so a second check spends the taker's gas to revert
+on a condition that already reverts.
+
+`InconsistentLoanToken` has no home in the base. Blue's invariant is
+`marketParams.loanToken == market.loanToken`; ours is that one currency of the parked pool equals
+the loan token, and only an adapter can check that. It moves to v3/v4.
+
+## 2026-09-04 (D1) — The factory key has to cover the whole envelope, not `(owner, salt)`
+
+`BlueBuyCallbackFactory` keys its registry `callbackOf[owner][salt]`. That is sound *there*, and
+only there: the callback's constructor takes exactly `(owner, MIDNIGHT, BLUE)`, and the last two are
+factory immutables, so `(owner, salt)` already determines the CREATE2 address completely.
+
+It does not survive the fork. Our constructor also takes the safety envelope — `IPriceRef`, the
+slippage budget, and whatever routing venue the adapter pins — and those vary per deployment. Copy
+Blue's key shape and one owner deploying the same salt with a tighter budget lands at a *different*
+address while overwriting the first one's registry slot: a live callback the factory no longer
+indexes, and a `callbackOf` that confidently reports the wrong envelope.
+
+So the key is `keccak256(abi.encode(owner, priceRef, maxSlippageWad, venueParams, salt))`, and the
+caller's salt is one input to it rather than the key itself. The derived key doubles as the CREATE2
+salt, which buys something worth having: **the address becomes a commitment to the envelope.** Two
+callbacks at one address cannot disagree about their price reference. Given that the envelope is
+the entire safety story — immutables are the safety envelope, and `callbackData` must never reach
+them — having it verifiable from the address alone is the property you want a taker or an indexer
+to be able to check.
+
+Three tests cover it, one per envelope member (`MAX_SLIPPAGE_WAD`, route venue, `IPriceRef`), each
+asserting same-owner-same-salt still yields distinct, separately-indexed callbacks.
+
+The venue-specific half arrives as opaque `bytes venueParams`, so `UniswapBuyCallbackFactoryBase`
+never needs to know what a v3 pool address or a v4 `PoolKey` is. Adapter factories keep typed
+`create` functions and encode into it.
+
+## 2026-09-04 (D1) — Leaning: the maker keeps custody of the position. Confirm at D2
+
+The base has no owner-withdraw path, which encodes an assumption that should be stated: the maker
+**keeps the v3 position NFT** and merely approves the callback for that `tokenId`, rather than
+transferring it in.
+
+Why it looks right. `decreaseLiquidity` only needs `isAuthorizedForToken`, and `collect` takes an
+arbitrary recipient, so an approved callback can do the whole unwind without ever holding the NFT.
+Custody would buy nothing and cost an escape hatch, a rescue path, and an ERC-721 receiver. It is
+also the strongest reading of "parking is permissionless": the thesis says a maker forced to migrate
+liquidity is no longer an existing LP, and non-custodial parking goes one better — the maker does
+not have to move the position at all.
+
+The exposure is that the maker can revoke approval or transfer the NFT out from under a live offer.
+That is the same class as pointing an offer at a bad pool: self-harm, and the take reverts when the
+loan tokens fail to arrive.
+
+Not settled here because it is really a v3-adapter question and D2 is where the `decreaseLiquidity`
+/ `collect` path gets written. If it turns out custody is forced, the base grows a withdraw path and
+this entry gets a reversal.
+
+## 2026-09-04 (D1) — `IPriceRef` shape: one function, pair-keyed
+
+`refSqrtPriceX96(token0, token1) -> uint160`, Q64.96, Uniswap's canonical ordering. Pair-keyed
+rather than pool-keyed, because park / route / reference are three independently chosen venues and
+the caller has no business telling the reference which pool to read. `V3TwapRef` resolves the pair
+to its own configured pool and calls `observe()`; `TruncatedOracleRef` resolves it to the oracle
+hook's pool. Reverting (`PairNotSupported`) rather than returning a guess makes a missing reference
+propagate out of `buyerAssetsBound` as a revert, which a routing layer must read as "no bound
+available" — not as zero.
+
+No staleness or window accessor on the interface. Those are properties of a reference, configured at
+its deployment, and the callback has no decision to make with them; the D11 comparison table can
+read them off each implementation directly.
+
+## 2026-09-05 (D2) — Custody settled: non-custodial, as the D1 leaning guessed
+
+The maker keeps the position NFT and `approve`s the callback for the `tokenId`. Confirmed by
+building it rather than by reading: `decreaseLiquidity` gates only on
+`_isApprovedOrOwner(msg.sender, tokenId)`, and `collect` takes an arbitrary `recipient`, so the
+entire unwind runs with the NFT never leaving the maker's wallet. `ownerOf(tokenId)` is asserted to
+still be the maker *after* a full unwind, so the property is tested rather than assumed.
+
+The D1 entry can be read as confirmed, not reversed. The base needs no owner-withdraw path, no
+rescue hatch, and no ERC-721 receiver — and the maker's escape hatch is the one they already had,
+which is the position manager itself.
+
+Revoking approval under a live offer breaks the maker's own offer and nobody else's; the take
+reverts when the tokens fail to arrive. There is a test for that too, because "fails closed" is a
+claim worth holding to.
+
+## 2026-09-05 (D2) — v4-core is the math dependency, even for the v3 adapter
+
+Added `lib/v4-core` and took `SqrtPriceMath`, `TickMath`, `FullMath`, `SafeCast` and `FixedPoint96`
+from it. All are `^0.8.0`, all compile at 0.8.34/osaka, and none of them transitively reach
+`PoolManager.sol` — which is the file pinned to exactly `0.8.26` and the reason the whole project
+binds Uniswap through interfaces. Verified by compiling a throwaway probe before writing anything
+that depends on it, because "the libraries are probably fine" is how a second compiler profile gets
+into a project.
+
+Two things had to be checked by hand rather than assumed:
+
+- v4 renamed the swap-limit constants. `MIN_SQRT_RATIO` / `MAX_SQRT_RATIO` in v3 are
+  `MIN_SQRT_PRICE` / `MAX_SQRT_PRICE` in v4. The *values* are identical (`4295128739` and
+  `1461446…970342`, tick range ±887272), so v4's `TickMath` is safe to point at a v3 pool. That is
+  a rename, not a semantic change, but nothing says so.
+- **`LiquidityAmounts` is not in v4-core.** It lives in v4-periphery, which this project does not
+  want as a dependency. `SourcingMathLib.amountsForLiquidity` composes the same result from
+  `SqrtPriceMath.getAmount0Delta` / `getAmount1Delta` and the three range cases directly.
+
+`SourcingMathLib` now exists, holding the *naive* bound only — position amounts at spot plus the
+residual converted at spot, no price impact and no fee. It is knowingly an over-estimate, and the
+size of that error is the subject of D5/D6.
+
+## 2026-09-05 (D2) — Swap the whole residual, not just what the fill needs
+
+`_sourceLoanToken` could swap exact-output for precisely the shortfall and leave the rest of the
+residual sitting on the callback. It swaps the entire residual instead.
+
+Two reasons. The surplus lands in the **buffer**, which is exactly where surplus loan token wants
+to be — the next fill is then served without touching the LP at all, which is the dust-take defence
+paying for itself. And no residual dust ever accumulates: a callback that holds three tokens is a
+callback somebody has to remember to `skim`.
+
+Verified end-to-end on the fork. A 10k+10k USDC/USDT position, unwound in full, collects
+**9,879.99 USDC + 9,999.99 USDT** and the residual swap returns **9,991.47 USDC** — a round-trip
+cost of **8.53 USDC, about 8.5bp**, of which 1bp is the pool fee and the rest is the pool's offset
+from parity plus impact. Total recovered: 19,871.46 USDC.
+
+That 8.5bp is the number D8 has to beat, and D7 is the test that shows what it becomes when
+somebody moves the pool first.
+
+## 2026-09-05 (D2) — What D2 deliberately does not do
+
+Recorded so the gaps read as scheduled rather than missed. Both are called out in the contract's
+own natspec:
+
+1. **The unwind is total.** `_sourceLoanToken` burns the whole position whatever the fill size.
+   Safe, and it throws away the yield leg on the first non-buffered take. Partial unwind is D3, and
+   the base's `shortfall`-shaped hook already has the right signature for it.
+2. **The residual swap has no price protection at all** — no `minOut`, sqrt-price limit at the
+   extremes. `PRICE_REF` and `MAX_SLIPPAGE_WAD` are held as immutables and not read. This is not an
+   oversight to fix quietly: D7's griefing test needs an unprotected version to attack so the cost
+   can be *quantified*, and D8 then adds the reference-relative bound and re-runs the same test.
+
+`amount0Min` / `amount1Min` are zero on the burn, and that one *is* correct rather than pending.
+Removing liquidity leaves `sqrtP` unchanged, so there is no burn slippage to protect against. What
+the burn does is thin the book the residual is about to be swapped into — finding A — and that
+lands on the swap, which is where D8's protection goes.

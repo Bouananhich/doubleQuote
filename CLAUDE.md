@@ -88,3 +88,12 @@ BUSL-1.1 and must not be vendored.
 
 **v3 first, v4 second, both shipped.** v3 is load-bearing because its native `observe()` makes the
 price-reference work straightforward. If a day goes missing, v4 is cut, never v3.
+
+## Workflow
+
+**Ship through PRs, not commits to `main`.** One branch per unit of work — typically a plan day or
+a single contract. Branch, commit, `gh pr create`, let CI run.
+
+- Branch names: `d2-v3-adapter`, `d5-sourcing-math`, i.e. the plan day plus the deliverable.
+- CI (`forge fmt --check`, `forge build --sizes`, `forge test`) must be green before merge.
+- `JOURNAL.md` entries go in the PR that makes the decision, not a follow-up.

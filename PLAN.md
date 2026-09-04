@@ -5,19 +5,44 @@ Two build weeks: **Fri 4 Sep → Fri 18 Sep 2026**. D1 is Fri 4 Sep.
 ## Where things stand — end of D1
 
 **Done:** public repo; `FRICTION.log` running; fork-Base harness green on a **single compiler
-profile** (8/8, solc 0.8.34 / evm osaka, Base pinned at block 50,875,000); all Midnight and
+profile** (solc 0.8.34 / evm osaka, Base pinned at block 50,875,000); all Midnight and
 Uniswap addresses verified on-chain; both parking venues chosen and pinned; FairFlow cleared for
-parking; CI green.
+parking; CI green. Plus, second half of D1:
+
+- `UniswapBuyCallbackBase` (abstract) + `UniswapBuyCallbackFactoryBase` (abstract) +
+  `IMidnightBuyCallback` / `IPriceRef` / `IUniswapBuyCallbackFactory`, forked from
+  `lib/midnight/src/periphery/blue-buy-callback/` (GPL-2.0, safe to fork — core is BUSL-1.1 and
+  must not be vendored). Four deliberate divergences from Blue, all in `JOURNAL.md`.
+- Blue's two unit suites forked onto the base and the factory: **36/36 green** in ~0.4s. Base and
+  factory tests need no fork, so only `ForkSanity` hits the network.
+- The buffer landed early, in the base rather than at D3 — it fixes the signature of
+  `_sourceLoanToken` (shortfall, not total), which both adapters implement.
+
+## D2 — done
+
+`UniswapV3BuyCallback` + `UniswapV3BuyCallbackFactory`, green against a real position minted in the
+real USDC/USDT 0.01% pool on the Base fork. **52/52** suite-wide.
+
+- **Custody settled, non-custodial.** The maker keeps the NFT and approves the callback for the
+  `tokenId`; `ownerOf` is asserted unchanged *after* a full unwind. The D1 leaning is confirmed,
+  not reversed.
+- **`lib/v4-core` added** for `SqrtPriceMath` / `TickMath` / `FullMath`, all `^0.8.0`, none of them
+  reaching the `0.8.26`-pinned `PoolManager`. Still one compiler profile. `SourcingMathLib` seeded
+  with the naive bound.
+- **Measured:** a 10k+10k position unwinds to 19,871.46 USDC; the residual swap costs 8.5bp, 1bp of
+  which is the pool fee. That is the number D8 has to beat.
+- Park and route proven independent — a callback routing through cbBTC/USDC rejects a swap callback
+  from the pool its position is parked in.
 
 **Next, in order:**
-1. `UniswapBuyCallbackBase` skeleton + CREATE2 factory, forked from
-   `lib/midnight/src/periphery/blue-buy-callback/` (GPL-2.0, safe to fork — core is BUSL-1.1 and
-   must not be vendored).
-2. Fork the three Blue callback tests into `UniswapBuyCallback*`.
-3. Then D2 as scheduled.
+1. D3: partial unwind. The base's `shortfall`-shaped hook is already the right signature; the
+   adapter currently ignores it and burns everything.
+2. Fork `BlueBuyCallbackIntegrationTest` — deferred from D1 on purpose. It needs a real offer taken
+   against real Midnight, which is now finally possible.
+3. Then D4 (v4 adapter) as scheduled.
 
-**Blocking nothing yet, but needed by D5:** `bound.py` does not exist. It has to be written from
-the spec in `JOURNAL.md` ("The bound math", plus findings A and B).
+**Open, needs a decision:** the repo has no root `LICENSE` file. The forked Morpho periphery is
+GPL-2.0-or-later, so the derivative is too; the file headers already say so but the repo does not.
 
 Build order is **v3 first, v4 second, both shipped**. v3 is load-bearing — its native
 `observe()` makes the price-reference work straightforward. If a day goes missing, v4 is cut,
@@ -46,8 +71,8 @@ The prep window (Mon 31 Aug → Thu 3 Sep) was not used. These are prerequisites
 - [x] **Pick the pools.** Both pinned in `test/ForkBase.sol` at block 50,875,000. Stable venue is
       USDC / **native USDT** (`0xfde4…9bb2`) 0.01% — ~50× deeper than the 0.05% pool. Stress venue
       is cbBTC/USDC 0.05%.
-- [ ] **Port `bound.py` reasoning into a Solidity sketch.** ⚠️ `bound.py` is not in this repo — it
-      needs recovering before D5/D6, since the cross-check depends on it.
+- [ ] **Port `bound.py` reasoning into a Solidity sketch.** *(`bound.py` recovered — present at the
+      repo root but untracked, hence D1 reading it as missing. Commit it. The port itself is D5/D6.)*
 
 ---
 
@@ -55,8 +80,8 @@ The prep window (Mon 31 Aug → Thu 3 Sep) was not used. These are prerequisites
 
 | Day | Deliverable |
 |-----|-------------|
-| **D1** (Fri 4) | Public repo ✅, `FRICTION.log` started ✅, fork-Base harness green. Fork the three Blue callback tests into `UniswapBuyCallback*`. `UniswapBuyCallbackBase` skeleton + factory. |
-| **D2** (Sat 5) | **v3 happy path.** Park in the NFT position; `onBuy` does `decreaseLiquidity` then `collect`, swaps residual, approves Midnight, returns `CALLBACK_SUCCESS`. One green fork test. |
+| **D1** (Fri 4) | Public repo ✅, `FRICTION.log` started ✅, fork-Base harness green ✅. `UniswapBuyCallbackBase` skeleton + factory ✅. Blue's two unit suites forked ✅; the integration suite waits on the v3 adapter. |
+| **D2** (Sat 5) | **v3 happy path** ✅. Park in the NFT position; `onBuy` does `decreaseLiquidity` then `collect`, swaps residual, approves Midnight, returns `CALLBACK_SUCCESS`. 16 green fork tests; custody settled non-custodial. |
 | **D3** (Sun 6) | Loan-token buffer + partial unwind in the shared base. Only touch the LP when the buffer can't cover the fill. Fixes dust-grief bleed and common-case gas. |
 | **D4** (Mon 7) | **v4 happy path.** Whole unwind inside one `PoolManager.unlock()` — `modifyLiquidity`, swap residual, settle one netted delta. Naive `buyerAssetsBound` on both. |
 | **D5** (Tue 8) | `SourcingMathLib` single-step version — exact for the stable pool, where a small residual never leaves the active tick range. Include the `max_share` liquidity cap. |
