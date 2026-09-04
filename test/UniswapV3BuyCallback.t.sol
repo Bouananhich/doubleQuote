@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 pragma solidity 0.8.34;
 
+import {Vm} from "forge-std/Vm.sol";
+
 import {Market} from "midnight/src/interfaces/IMidnight.sol";
 import {CALLBACK_SUCCESS} from "midnight/src/libraries/ConstantsLib.sol";
 
@@ -22,6 +24,11 @@ import {StubPriceRef} from "./mocks/StubPriceRef.sol";
 contract UniswapV3BuyCallbackTest is ForkBase {
     /// @dev 1 bp. Held but not yet read by the adapter; see the note on `UniswapV3BuyCallback`.
     uint256 internal constant MAX_SLIPPAGE_WAD = 0.0001e18;
+
+    /// @dev `DecreaseLiquidity(uint256,uint128,uint256,uint256)` on the position manager. Counting
+    /// these is how a test tells one burn from two.
+    bytes32 internal constant DECREASE_LIQUIDITY_TOPIC =
+        0x26f6a048ee9138f2c0ce266f322cb99228e8d619ae2bff30c67f8dcf9d2377b4;
 
     /// @dev USDC (`0x8335…`) sorts below native USDT (`0xfde4…`), so the loan token is token0 and
     /// the residual is token1.
@@ -114,6 +121,7 @@ contract UniswapV3BuyCallbackTest is ForkBase {
     /// USDT into USDC, approve Midnight, return `CALLBACK_SUCCESS`.
     function test_onBuySourcesFromTheParkedPosition() public {
         uint256 buyerAssets = 5_000e6;
+        uint128 liquidityBefore = _liquidity();
 
         vm.prank(MIDNIGHT);
         bytes32 result = callback.onBuy(bytes32(0), market, buyerAssets, 0, 0, maker, _callbackData());
@@ -122,8 +130,11 @@ contract UniswapV3BuyCallbackTest is ForkBase {
         assertGe(IERC20Meta(USDC).balanceOf(address(callback)), buyerAssets, "not enough loan token sourced");
         assertEq(IERC20Meta(USDC).allowance(address(callback), MIDNIGHT), buyerAssets, "Midnight not approved");
 
-        // D2 unwinds in full; D3 makes this partial.
-        assertEq(_liquidity(), 0, "position not unwound");
+        // Only the fill's share is burnt. A 5k fill against a ~19.9k position should leave roughly
+        // three quarters of the liquidity still earning.
+        uint128 remaining = _liquidity();
+        assertGt(remaining, (liquidityBefore * 70) / 100, "burnt far more than the fill needed");
+        assertLt(remaining, liquidityBefore, "nothing was burnt");
 
         // The residual is swapped in its entirety, so no non-loan-token dust is left behind.
         assertEq(IERC20Meta(USDT).balanceOf(address(callback)), 0, "residual dust left on the callback");
@@ -152,15 +163,93 @@ contract UniswapV3BuyCallbackTest is ForkBase {
         assertEq(IERC20Meta(USDC).balanceOf(address(callback)), buffer, "buffer should not have moved");
     }
 
-    /// @dev A stable pair round-trips near 1:1, so a full unwind of 10k+10k should surface roughly
-    /// 20k USDC. Loose bounds — this is checking the residual actually got swapped, not pricing it.
-    function test_fullUnwindRecoversBothSidesAsLoanToken() public {
+    /// @dev A fill close to the position's capacity draws nearly all of it, and both sides come
+    /// back as loan token — a stable pair round-trips near 1:1, so 10k+10k surfaces roughly 20k
+    /// USDC. Loose bounds: this checks the residual actually got swapped, it does not price it.
+    /// @dev Deliberately not asserting the position lands at exactly zero. The sizing is
+    /// proportional, so a fill below capacity leaves a sliver behind by design; the
+    /// burn-everything branch is pinned exactly in `SourcingMathLib.t.sol`, where it does not
+    /// depend on the fork's live price.
+    function test_aLargeFillUnwindsNearlyAllOfThePosition() public {
+        uint128 liquidityBefore = _liquidity();
+
         vm.prank(MIDNIGHT);
-        callback.onBuy(bytes32(0), market, 1e6, 0, 0, maker, _callbackData());
+        callback.onBuy(bytes32(0), market, 19_500e6, 0, 0, maker, _callbackData());
+
+        assertLt(_liquidity(), liquidityBefore / 20, "should have drawn nearly the whole position");
 
         uint256 recovered = IERC20Meta(USDC).balanceOf(address(callback));
-        assertGt(recovered, 19_000e6, "residual does not look swapped");
+        assertGt(recovered, 19_500e6, "residual does not look swapped");
         assertLt(recovered, 20_100e6, "recovered more than was parked");
+    }
+
+    /// PARTIAL UNWIND ///
+
+    /// @dev The point of D3. A small fill should cost the maker a small slice of the position, not
+    /// the whole thing — the position keeps earning, and the residual swap that follows is small
+    /// enough to be cheap.
+    function test_burnIsProportionalToTheFill() public {
+        uint128 liquidityBefore = _liquidity();
+
+        vm.prank(MIDNIGHT);
+        callback.onBuy(bytes32(0), market, 2_000e6, 0, 0, maker, _callbackData());
+
+        // ~2k of a ~19.9k position is ~10%, plus the impact margin.
+        uint256 burnt = liquidityBefore - _liquidity();
+        assertGt(burnt, (uint256(liquidityBefore) * 9) / 100, "burnt less than the fill needed");
+        assertLt(burnt, (uint256(liquidityBefore) * 12) / 100, "burnt much more than the fill needed");
+    }
+
+    /// @dev A bigger fill burns more. Guards against the sizing collapsing to a constant, which is
+    /// how a "partial" unwind quietly becomes a full one again.
+    function test_biggerFillBurnsMoreLiquidity() public {
+        uint128 liquidityBefore = _liquidity();
+
+        uint256 snapshot = vm.snapshotState();
+        vm.prank(MIDNIGHT);
+        callback.onBuy(bytes32(0), market, 2_000e6, 0, 0, maker, _callbackData());
+        uint256 smallBurn = liquidityBefore - _liquidity();
+
+        vm.revertToState(snapshot);
+        vm.prank(MIDNIGHT);
+        callback.onBuy(bytes32(0), market, 8_000e6, 0, 0, maker, _callbackData());
+        uint256 largeBurn = liquidityBefore - _liquidity();
+
+        assertGt(largeBurn, smallBurn * 3, "burn does not scale with fill size");
+    }
+
+    /// @dev The sizing must land in one round on the product venue. Two rounds means a second
+    /// `decreaseLiquidity` plus a second swap on the taker's gas, which is what the impact margin
+    /// exists to avoid — and a regression here is silent, since the fallback still returns the
+    /// right amount.
+    function test_theCommonCaseNeedsOnlyOneBurn() public {
+        vm.prank(MIDNIGHT);
+        vm.recordLogs();
+        callback.onBuy(bytes32(0), market, 5_000e6, 0, 0, maker, _callbackData());
+
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        uint256 burns;
+        for (uint256 i; i < logs.length; ++i) {
+            // IncreaseLiquidity/DecreaseLiquidity on the position manager.
+            if (logs[i].emitter == V3_POSITION_MANAGER && logs[i].topics[0] == DECREASE_LIQUIDITY_TOPIC) ++burns;
+        }
+
+        assertEq(burns, 1, "fell back to a second burn on the product venue");
+    }
+
+    /// @dev The dust-take defence, end to end. With a funded buffer, repeated small takes never
+    /// reach the position at all — no burn, no swap, nothing to bleed.
+    function test_repeatedDustTakesNeverTouchAFundedPosition() public {
+        deal(USDC, address(callback), 1_000e6);
+        uint128 liquidityBefore = _liquidity();
+
+        for (uint256 i; i < 20; ++i) {
+            vm.prank(MIDNIGHT);
+            callback.onBuy(bytes32(0), market, 1e6, 0, 0, maker, _callbackData());
+        }
+
+        assertEq(_liquidity(), liquidityBefore, "dust takes reached the position");
+        assertEq(IERC20Meta(USDC).balanceOf(address(callback)), 1_000e6, "buffer was spent");
     }
 
     /// QUOTING ///

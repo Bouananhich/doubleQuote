@@ -28,6 +28,21 @@ import {SqrtPriceMath} from "v4-core/libraries/SqrtPriceMath.sol";
 ///   the slippage budget. Burn past that and `sourced(dL)` stops being monotone, at which point
 ///   bisection is invalid — it converges on a point that is neither maximal nor safe.
 library SourcingMathLib {
+    /// @dev Stand-in for the residual swap's price impact, which `liquidityForTarget` does not
+    /// model. Without it the sizing has no slack at all: the spot-and-fee estimate turns out to be
+    /// very nearly exact, so *any* impact makes it come up short and forces a second burn.
+    ///
+    /// @dev Sized from measurement, not intuition. On the D2 fork run — a 10k+10k USDC/USDT
+    /// position, a 5k fill — the realised sourcing came in **0.2bp** below the estimate. 25bp is
+    /// roughly a hundredfold cushion on the product venue while costing the maker only the yield on
+    /// 0.25% more liquidity than the fill strictly needed, and even that is not lost: the surplus
+    /// lands in the buffer and serves the next fill.
+    ///
+    /// @dev It will not be enough everywhere. A thin venue can move further than this on a large
+    /// fill, which is why the caller still needs a fallback. Replacing this constant with an actual
+    /// impact term is D5/D6.
+    uint256 internal constant IMPACT_MARGIN_BPS = 25;
+
     /// @notice Token amounts a position of `liquidity` over `[sqrtLower, sqrtUpper]` is worth at
     /// `sqrtPriceX96`.
     /// @dev Rounds down: this feeds a bound that must never over-promise.
@@ -53,6 +68,62 @@ library SourcingMathLib {
             // Entirely above the range: all token1.
             amount1 = SqrtPriceMath.getAmount1Delta(sqrtLowerX96, sqrtUpperX96, liquidity, false);
         }
+    }
+
+    /// @notice How much liquidity to burn to raise `target` of the loan token.
+    ///
+    /// @dev Token amounts are exactly linear in liquidity at a fixed price and range, so the whole
+    /// sizing reduces to one proportion: burn the fraction of the position whose value covers the
+    /// target. What is *not* linear is the residual swap, and that is the entire error term.
+    ///
+    /// @dev Biased conservative on purpose — every approximation here rounds towards burning **more**
+    /// liquidity than strictly necessary:
+    ///   - the route pool's fee is subtracted from the residual's contribution;
+    ///   - uncollected fees are excluded from the denominator, even though `collect` sweeps them
+    ///     anyway, so they arrive as a bonus rather than as something the estimate leaned on;
+    ///   - the division rounds up.
+    ///
+    /// @dev The bias is deliberate because the two failure directions are not symmetric. Burning a
+    /// little too much costs some yield and parks the surplus in the buffer, where it serves the
+    /// next fill. Burning too little means the caller has to go back and unwind the remainder,
+    /// paying for a second burn and a second swap — strictly worse than having burnt more the first
+    /// time. What is still missing is price impact, which pushes the other way; until that is
+    /// modelled (D5/D6) the caller needs a fallback for the optimistic case.
+    ///
+    /// @param targetIsToken0 Whether the token being raised is the pool's `token0`.
+    /// @param routeFeePips The residual swap venue's fee, in hundredths of a bip (e.g. 100 = 0.01%).
+    /// @return The liquidity to burn, never more than `liquidity`.
+    function liquidityForTarget(
+        uint160 sqrtPriceX96,
+        uint160 sqrtLowerX96,
+        uint160 sqrtUpperX96,
+        uint128 liquidity,
+        bool targetIsToken0,
+        uint256 target,
+        uint24 routeFeePips
+    ) internal pure returns (uint128) {
+        if (liquidity == 0 || target == 0) return 0;
+
+        (uint256 amount0, uint256 amount1) = amountsForLiquidity(sqrtPriceX96, sqrtLowerX96, sqrtUpperX96, liquidity);
+
+        (uint256 targetSide, uint256 residualSide) = targetIsToken0 ? (amount0, amount1) : (amount1, amount0);
+
+        uint256 residualQuoted =
+            targetIsToken0 ? quote1For0(residualSide, sqrtPriceX96) : quote0For1(residualSide, sqrtPriceX96);
+
+        // Net of the swap that will convert it. `routeFeePips` is out of 1e6.
+        uint256 residualNet = FullMath.mulDiv(residualQuoted, 1e6 - routeFeePips, 1e6);
+        uint256 sourceable = targetSide + residualNet;
+
+        uint256 targetWithMargin = target + FullMath.mulDivRoundingUp(target, IMPACT_MARGIN_BPS, 10_000);
+
+        // The position cannot be valued, or cannot cover the target even in full. Burn all of it
+        // and let the caller decide whether what came out was enough.
+        if (sourceable == 0 || targetWithMargin >= sourceable) return liquidity;
+
+        uint256 needed = FullMath.mulDivRoundingUp(liquidity, targetWithMargin, sourceable);
+
+        return needed >= liquidity ? liquidity : uint128(needed);
     }
 
     /// @notice Value of `amount1` of token1, denominated in token0, at `sqrtPriceX96`.

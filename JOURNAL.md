@@ -456,3 +456,79 @@ own natspec:
 Removing liquidity leaves `sqrtP` unchanged, so there is no burn slippage to protect against. What
 the burn does is thin the book the residual is about to be swapped into — finding A — and that
 lands on the swap, which is where D8's protection goes.
+
+## 2026-09-05 (D3) — Partial unwind: one proportion, because amounts are linear in liquidity
+
+`_sourceLoanToken` now burns the slice the fill needs instead of the whole position. The sizing is
+a single proportion rather than a search, and the reason is worth stating: at a fixed price and
+range, `getAmount0Delta` / `getAmount1Delta` are **exactly linear in liquidity**. Burning `dL`
+returns exactly `dL/L` of each side. So "how much do I burn" reduces to "what fraction of the
+position's value do I need", with no iteration.
+
+What is *not* linear is the residual swap, and that is the whole error term — which is where the
+rest of this entry goes.
+
+The split follows the D1 rule: sizing is venue-agnostic and lives in `SourcingMathLib`
+(`liquidityForTarget`), execution stays in the adapter. `SourcingMathLib` also gets its own
+fork-free unit tests, which pin branches and rounding that a fork test cannot, since the live price
+moves the answer.
+
+## 2026-09-05 (D3) — An estimate that is too accurate is a bug, if it needs to be conservative
+
+The first working version was strictly worse than D2 and every test still passed. Worth recording
+because the failure was invisible in green.
+
+The sizing valued the position at spot and subtracted the route pool's fee. That estimate turns out
+to be **very nearly exact** — on the fork, realised sourcing came in **0.2bp** below it, that gap
+being price impact. But "nearly exact" means *zero slack*, and the estimate is used to decide how
+much to burn *before* the swap happens. So every fill came up a hair short, hit the fallback, burnt
+the remaining liquidity, and swapped again. Two burns and two swaps, the position fully drained,
+gas up from 304k to 479k. Partial unwind that was never partial.
+
+The tests did not catch it because the D2 assertions encoded the *old* behaviour —
+`assertEq(_liquidity(), 0)` was written when a full unwind was correct, so it kept passing for
+precisely the wrong reason. The tell was gas, not a red test. Any test that asserts a quantity is
+zero should be re-read when the feature that made it zero is the thing being changed.
+
+Fix is `IMPACT_MARGIN_BPS = 25`: size for 25bp more than the shortfall. It is a stand-in for the
+impact term, and it is sized from the measurement above rather than picked — about a hundredfold
+cushion on the product venue. The cost of the margin is close to nothing, because the surplus is
+not lost: it lands in the buffer and serves the next fill. D5/D6 replace the constant with an
+actual impact model, and that is what removes the fallback.
+
+The fallback stays regardless. A thin venue can move further than 25bp on a large fill, and failing
+a fill the position could have covered is worse than paying for a second burn.
+
+## 2026-09-05 (D3) — Correcting the plan: partial unwind costs gas, it does not save it
+
+`PLAN.md` has D3 as fixing "dust-grief bleed and common-case gas". Half right, and the halves come
+from different mechanisms:
+
+| | 5k fill, same position |
+|---|---|
+| D2, unconditional full unwind | 304,559 gas |
+| D3, sized partial burn | 322,243 gas |
+
+Partial unwind is **~18k more expensive** per fill — it adds a `getPool`, a `slot0` and the sizing
+math to the taker's bill. What the maker gets for that is their position: 75% of the liquidity is
+still earning after a 5k fill instead of 0%. That is the trade, and it is clearly worth it, but it
+is not a gas saving and the plan should not have implied it was.
+
+**The common-case gas win is the buffer, and the buffer landed on D1.** A buffered fill touches no
+pool at all — no burn, no collect, no swap. That is where the cheap path comes from; partial unwind
+is about capital efficiency.
+
+## 2026-09-05 (D3) — The dust-take defence needs a *funded* buffer
+
+Tested and true: with a funded buffer, twenty consecutive dust takes leave the position completely
+untouched and the buffer unspent. That is the defence working.
+
+But it only works if the buffer is funded. The surplus a sized burn leaves behind is the 25bp
+margin on that fill — a 5k fill leaves ~12 USDC — which is nowhere near enough to absorb a run of
+dust takes on its own. An unfunded callback facing dust takes from block one will burn a sliver and
+swap on every single one.
+
+So the buffer is a **maker policy**, not an automatic property, and the docs should say so: park
+some idle loan token alongside the position or accept the bleed. Sizing that policy properly — how
+large a buffer for how much expected dust — is a question for the D9 grief test, which is where the
+bleed gets quantified.
