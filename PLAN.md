@@ -12,20 +12,23 @@ never v3.
 
 The prep window (Mon 31 Aug → Thu 3 Sep) was not used. These are prerequisites, not optional:
 
-- [ ] **Fork harness spike.** One Foundry profile on 0.8.34 / osaka, forking Base, `setUp()`
+- [x] **Fork harness spike.** One Foundry profile on 0.8.34 / osaka, forking Base, `setUp()`
       binding deployed Midnight, a v3 pool + `NonfungiblePositionManager`, and v4 `PoolManager`
       + `PositionManager` **through interfaces only**. Should need no second compiler profile.
-      *Kill-switch: if this is not green by end of D2, ship v3 only and say so in the README.*
-- [ ] **Confirm Base supports the Osaka opcodes** Midnight relies on (`clz`) at the fork block,
-      plus `mcopy` / `tload` / `tstore`.
+      *Kill-switch not needed — green on D1, single profile, 8/8 in 3.7s.*
+- [x] **Confirm Base supports the Osaka opcodes** Midnight relies on (`clz`) at the fork block.
+      Midnight is deployed and live on Base compiled at osaka, and `clz` is exercised directly in
+      the fork by `ClzProbe` in `test/ForkSanity.t.sol`.
 - [ ] **Verify FairFlow's hook permission bits** exclude `beforeRemoveLiquidity`. Five minutes,
       and the venue choice rests on it.
 - [ ] **Read:** Midnight whitepaper, `take()` lines 363–500, `BlueBuyCallbackIntegrationTest.sol`
-      end to end.
-- [ ] **Pick the pools.** Base stable pool (pin the exact USDT variant — native / USDT0 / USDT.e)
-      and the cbBTC/USDC pool. Pin the fork block.
-- [ ] **Port `bound.py` reasoning into a Solidity sketch.** Math is validated; this is
-      translation, not derivation.
+      end to end. *(Partial: `BlueBuyCallback.sol`, `ICallbacks.sol` and the `Market` struct read
+      and confirmed against the design notes. Whitepaper and `take()` outstanding.)*
+- [x] **Pick the pools.** Both pinned in `test/ForkBase.sol` at block 50,875,000. Stable venue is
+      USDC / **native USDT** (`0xfde4…9bb2`) 0.01% — ~50× deeper than the 0.05% pool. Stress venue
+      is cbBTC/USDC 0.05%.
+- [ ] **Port `bound.py` reasoning into a Solidity sketch.** ⚠️ `bound.py` is not in this repo — it
+      needs recovering before D5/D6, since the cross-check depends on it.
 
 ---
 

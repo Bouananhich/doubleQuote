@@ -14,3 +14,21 @@ part that makes the feedback actionable and the part that is impossible to recon
 ---
 
 2026-09-04 09:00  [meta]  log started at D1, per plan.
+
+2026-09-04 18:20  [v3-periphery/v4-core]  pragma pinning, avoided rather than hit.
+    Expected to import Uniswap sources directly and compile them alongside the callback.
+    Could not: v3 implementations are `=0.7.6`, v4's PoolManager.sol/PositionManager.sol are
+    exactly `0.8.26`, and this project follows Midnight at 0.8.34. Wrote test/interfaces/
+    IUniswapMinimal.sol by hand instead and bound the already-deployed Base contracts.
+    Worth stating precisely in FEEDBACK.md: the cost here was NOT a multi-profile build, because
+    fork-testing against a chain where everything is deployed sidesteps it entirely. The cost was
+    having to know that workaround exists. It is not in any Uniswap integration doc I found.
+    (cost: ~25m, mostly writing interfaces by hand)
+
+2026-09-04 18:35  [docs]  no canonical machine-readable deployment list found for Base.
+    Expected an official addresses page/JSON to resolve v3 factory, NonfungiblePositionManager,
+    v4 PoolManager and PositionManager on Base. Ended up cross-validating on-chain instead:
+    NPM.factory() == v3 factory, PositionManager.poolManager() == PoolManager,
+    factory.feeAmountTickSpacing(500) == 10. That worked and is arguably better practice, but it
+    is a verification step every integrator repeats from scratch.
+    (cost: ~15m)

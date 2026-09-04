@@ -3,4 +3,18 @@ src = "src"
 out = "out"
 libs = ["lib"]
 
-# See more config options https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options
+# Follows Midnight: it is compiled at 0.8.34 / osaka and deployed on Base, so the callback
+# must compile against the same interfaces at the same version.
+solc = "0.8.34"
+evm_version = "osaka"
+optimizer = true
+optimizer_runs = 466
+bytecode_hash = "none"
+
+# Uniswap is bound through interfaces against already-deployed Base contracts rather than
+# compiled from source, which keeps this to a single compiler profile despite v3 being
+# pinned at 0.7.6 and v4's PoolManager/PositionManager at exactly 0.8.26.
+
+[fmt]
+line_length = 120
+wrap_comments = true

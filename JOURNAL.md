@@ -169,3 +169,42 @@ Prep window (Mon 31 Aug → Thu 3 Sep) went unused — the fork harness spike, t
 the FairFlow hook permission bits, the Midnight reading and the pool selection all carry into D1.
 The harness kill-switch matters more as a result: if the single-profile fork-Base setup isn't green
 by end of D2, ship v3 only and say so in the README.
+
+## 2026-09-04 (D1) — Harness green, single profile, kill-switch not needed
+
+The fork-first bet paid off. One Foundry profile at solc 0.8.34 / evm osaka, forking Base at block
+**50,875,000**, binding everything through hand-written interfaces. 8/8 in 3.7s. No `deployCode`
+dance, no second compiler profile, no `MorphoImport.sol` pattern.
+
+Everything below was verified on-chain rather than taken from documentation or memory:
+
+| | Address | How it was confirmed |
+|---|---|---|
+| Midnight | `0xAdedD8ab6dE832766Fedf0FaC4992E5C4D3EA18A` | responds to `configurator()` (non-zero), `feeSetter()`, `feeClaimer()`, `tickSpacingSetter()` |
+| v3 Factory | `0x33128a8fC17869897dcE68Ed026d694621f6FDfD` | `feeAmountTickSpacing(500) == 10`, `(100) == 1` |
+| v3 `NonfungiblePositionManager` | `0x03a520b32C04BF3bEEf7BEb72E919cf822Ed34f1` | `.factory()` returns the above |
+| v4 `PoolManager` | `0x498581fF718922c3f8e6A244956aF099B2652b2b` | ~24KB code |
+| v4 `PositionManager` | `0x7C5f5A4bBd8fD63184577525326123B519429bDc` | `.poolManager()` returns the above |
+
+**The USDT variant question is resolved: native USDT** (`0xfde4C96c8593536E31F229EA8f37b2ADa2699bb2`),
+not USDT0 or USDT.e. The USDC/USDT **0.01%** pool carries L≈3.93e14 against 7.57e12 in the 0.05%
+pool — roughly 50× deeper — so the fee tier choice is made on depth, and depth is what the bound
+math is sensitive to. Stress venue is cbBTC/USDC 0.05% (`0xfBB6…43ef`, L≈1.89e12, tick −66813).
+
+Both venues have live v3 oracles (`observe()` over a 1800s window returns distinct cumulatives on
+each), which is the `V3TwapRef` dependency and confirms v3 as the load-bearing adapter.
+
+Two things worth recording that aren't in the original notes:
+
+**The osaka question has two halves and only one was interesting.** "Does Base support `clz`" is
+answered trivially — Midnight is compiled at osaka and live on Base. The half that actually gates
+the build is whether the *fork EVM* executes it, so `ClzProbe` in `ForkSanity.t.sol` exercises
+`clz` directly in-fork rather than assuming.
+
+**Morpho publishes no machine-readable deployment list**, so the Midnight address was found by
+search and then confirmed by calling four Midnight-specific selectors on it. Recorded here because
+the address is now hardcoded in `ForkBase.sol` and the provenance should be auditable.
+
+**Open gap:** `bound.py` — described in the design notes as written and validated on 31 Aug — is
+not in this repo. D5 and D6 both cross-check the Solidity against its outputs. It needs recovering
+or rewriting before then.
