@@ -1,4 +1,4 @@
-# UniswapBuyCallback
+# doubleQuote
 
 Hackathon project (ETHGlobal, Uniswap track). A Midnight maker buy-callback that parks a
 lender's capital in a Uniswap LP position instead of a Morpho Blue market, unwinding it
