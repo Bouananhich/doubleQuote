@@ -45,6 +45,17 @@ abstract contract ForkBase is Test {
     /// test can move without touching the price the burn sizing reads off the parked pool.
     address internal constant POOL_USDC_USDT_500 = 0xB7F084c7f7f1c680d08780e2b2ef4F2133DB0Df8;
 
+    /// @dev The v4 counterpart of the product venue: USDC/USDT, 0.01%, tick spacing 1, no hooks.
+    /// Identified by its `PoolKey` rather than an address, since v4 pools are not contracts.
+    /// Initialised and at tick 7 at `FORK_BLOCK`, the same tick as the v3 pool.
+    ///
+    /// @dev **Far thinner than v3.** 5.43e11 of active liquidity against the v3 pool's 3.93e14 —
+    /// a factor of ~724 at this block. Nothing to do with the adapter, but it caps how large a
+    /// fill the v4 tests can use before the residual swap's impact swamps the sizing margin, and
+    /// it is a real finding about where the liquidity actually is.
+    uint24 internal constant V4_USDC_USDT_FEE = 100;
+    int24 internal constant V4_USDC_USDT_TICK_SPACING = 1;
+
     function setUp() public virtual {
         vm.createSelectFork(_baseRpcUrl(), FORK_BLOCK);
     }

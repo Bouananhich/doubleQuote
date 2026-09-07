@@ -640,3 +640,59 @@ the **volatile venue**, where the residual swap crosses ticks and range exit is 
 frontier chart on D11 should show the two venues side by side or it will look like solving a
 problem that was already solved. If the volatile-venue gap also turns out to be small, that is a
 finding worth reporting rather than a reason to build the tick walk anyway.
+
+## 2026-09-07 (D4) — v4 forces a custody choice that v3 did not, so both adapters get built
+
+Two facts about v4-core decide the shape of this day, and both were verified in the source rather
+than assumed:
+
+- **`PoolManager.modifyLiquidity` keys a position by `owner: msg.sender`** (`PoolManager.sol:161`).
+  The only position a contract can burn is one it owns.
+- **`unlock` reverts `AlreadyUnlocked` when nested** (`PoolManager.sol:105`). A decrease routed
+  through `PositionManager` opens its own unlock, so it cannot share one with our residual swap.
+
+Together those mean the v4 adapter cannot have both of the things v3 gave us for free. Either the
+maker keeps an NFT and the settlement takes two unlocks and four token movements — which is what v3
+already does, in different syntax — or the callback owns the liquidity directly and the whole
+unwind nets inside one unlock, which is the only reason `JOURNAL.md` said v4 earns a second adapter
+at all.
+
+**Decision: build both.** The custodial one (`UniswapV4BuyCallback`) is the thesis artifact; the
+non-custodial one is the honest comparison. Shipping only the fast path would leave the gas table
+comparing a custodial design against a non-custodial one and calling the difference "v4", which is
+not what the difference is. Shipping only the NFT path would spend a day proving v4 is not cheaper,
+having declined to build the configuration where it is.
+
+The cost is real and is not hidden: this is more than the one day D4 has. It comes out of slack,
+and if it eats into D5 the tick walk is the thing that gives, per the ranked risks.
+
+**How the custodial one is constrained.** D1 ruled out an owner-withdraw path on the base because
+non-custodial parking made it unnecessary. That reasoning does not reach here, so `unpark` exists —
+owner-only, and it takes **no recipient**: the funds' only destinations are back to `OWNER` or into
+settling `OWNER`'s own offers. `park` likewise pulls only from `OWNER`. That is weaker than "the
+maker never gives up the NFT" and it is the most this design can offer, so it is stated as a
+property and tested as one rather than described in a comment.
+
+Native currency is refused outright, at deployment and at parking. Settling ETH needs a payable
+path and a `receive` hook, and each new way for value to enter the contract is more surface for the
+envelope to cover. It costs the ETH/USDC pools, which are the deepest on v4, and that is a real
+limitation rather than an oversight.
+
+## 2026-09-07 (D4) — Where the liquidity actually is: v4 USDC/USDT is 724x thinner than v3
+
+At `FORK_BLOCK` the v4 USDC/USDT 0.01% pool holds **5.43e11** of active liquidity. Its v3
+counterpart holds **3.93e14**. Same pair, same fee tier, same chain, same block, and both at tick 7.
+
+This is not a footnote for a project whose thesis is "park where the yield already is". Parking the
+v3 fixture's 10k+10k in the v4 pool would make the maker's position seven times the entire pool's
+active liquidity, and every residual swap would move the price by more than the sizing margin
+covers. The v4 suite parks 2k+2k and fills in the hundreds — sized to the venue, not to v3.
+
+Two consequences worth carrying forward:
+
+- **The gas table has to be labelled honestly.** v3 and v4 are the same operation over different
+  plumbing, not the same trade. Comparing a 5,000 fill on v3 against a 500 fill on v4 and reporting
+  the gas difference without that caveat would be misleading, and D11 has to say so.
+- **It is feedback.** A developer choosing where to build against Uniswap on Base today would find
+  the stable-pair liquidity still overwhelmingly in v3. That belongs in `FEEDBACK.md`, stated as a
+  measurement rather than a complaint.
