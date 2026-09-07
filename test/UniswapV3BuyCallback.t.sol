@@ -7,101 +7,35 @@ import {Market} from "midnight/src/interfaces/IMidnight.sol";
 import {CALLBACK_SUCCESS} from "midnight/src/libraries/ConstantsLib.sol";
 
 import {UniswapV3BuyCallback} from "../src/UniswapV3BuyCallback.sol";
-import {UniswapV3BuyCallbackFactory} from "../src/UniswapV3BuyCallbackFactory.sol";
 import {IMidnightBuyCallback} from "../src/interfaces/IMidnightBuyCallback.sol";
 import {INonfungiblePositionManager, IUniswapV3Pool} from "../src/interfaces/IUniswapV3.sol";
 import {IUniswapV3BuyCallback} from "../src/interfaces/IUniswapV3BuyCallback.sol";
 
-import {ForkBase} from "./ForkBase.sol";
+import {ParkedPositionBase} from "./ParkedPositionBase.sol";
 import {IERC20Meta} from "./interfaces/IUniswapMinimal.sol";
 import {PoolPusher} from "./mocks/PoolPusher.sol";
-import {StubPriceRef} from "./mocks/StubPriceRef.sol";
 
 /// @notice D2: the v3 happy path, against a real position minted in the real USDC/USDT 0.01% pool
 /// on a Base fork.
 ///
 /// @dev The maker keeps the NFT throughout and only `approve`s the callback — every test here
 /// would fail if custody were required, which is what settles the D1 leaning.
-contract UniswapV3BuyCallbackTest is ForkBase {
-    /// @dev 1 bp. Held but not yet read by the adapter; see the note on `UniswapV3BuyCallback`.
-    uint256 internal constant MAX_SLIPPAGE_WAD = 0.0001e18;
-
+contract UniswapV3BuyCallbackTest is ParkedPositionBase {
     /// @dev `DecreaseLiquidity(uint256,uint128,uint256,uint256)` on the position manager. Counting
     /// these is how a test tells one burn from two.
     bytes32 internal constant DECREASE_LIQUIDITY_TOPIC =
         0x26f6a048ee9138f2c0ce266f322cb99228e8d619ae2bff30c67f8dcf9d2377b4;
 
-    /// @dev USDC (`0x8335…`) sorts below native USDT (`0xfde4…`), so the loan token is token0 and
-    /// the residual is token1.
-    uint256 internal constant PARKED_USDC = 10_000e6;
-    uint256 internal constant PARKED_USDT = 10_000e6;
-
-    address internal maker = makeAddr("maker");
-    StubPriceRef internal priceRef;
-    UniswapV3BuyCallbackFactory internal factory;
-    UniswapV3BuyCallback internal callback;
+    /// @dev Enough of a market to identify the loan token, which is all `onBuy` reads. Never
+    /// touched on-chain — `MidnightIntegration.t.sol` is where a real one gets created.
     Market internal market;
-    uint256 internal tokenId;
 
     function setUp() public override {
         super.setUp();
 
-        priceRef = new StubPriceRef(1 << 96);
-        factory = new UniswapV3BuyCallbackFactory(MIDNIGHT, V3_POSITION_MANAGER);
-        callback = UniswapV3BuyCallback(
-            factory.createCallback(maker, priceRef, MAX_SLIPPAGE_WAD, POOL_USDC_USDT_100, bytes32(0))
-        );
-
         market.chainId = block.chainid;
         market.midnight = MIDNIGHT;
         market.loanToken = USDC;
-
-        tokenId = _mintPosition();
-
-        // The whole custody story: the maker keeps the NFT and approves the callback for it.
-        vm.prank(maker);
-        INonfungiblePositionManager(V3_POSITION_MANAGER).approve(address(callback), tokenId);
-    }
-
-    /// @dev Mints a real position tightly around the live tick, which is where a stable-pair LP
-    /// actually earns and therefore the configuration the bound has to cope with.
-    function _mintPosition() internal returns (uint256 id) {
-        (, int24 tick,,,,,) = IUniswapV3Pool(POOL_USDC_USDT_100).slot0();
-        int24 spacing = IUniswapV3Pool(POOL_USDC_USDT_100).tickSpacing();
-        int24 lower = ((tick - 50) / spacing) * spacing;
-        int24 upper = ((tick + 50) / spacing) * spacing;
-
-        deal(USDC, maker, PARKED_USDC);
-        deal(USDT, maker, PARKED_USDT);
-
-        vm.startPrank(maker);
-        IERC20Meta(USDC).approve(V3_POSITION_MANAGER, PARKED_USDC);
-        IERC20Meta(USDT).approve(V3_POSITION_MANAGER, PARKED_USDT);
-        (id,,,) = INonfungiblePositionManager(V3_POSITION_MANAGER)
-            .mint(
-                INonfungiblePositionManager.MintParams({
-                    token0: USDC,
-                    token1: USDT,
-                    fee: 100,
-                    tickLower: lower,
-                    tickUpper: upper,
-                    amount0Desired: PARKED_USDC,
-                    amount1Desired: PARKED_USDT,
-                    amount0Min: 0,
-                    amount1Min: 0,
-                    recipient: maker,
-                    deadline: block.timestamp
-                })
-            );
-        vm.stopPrank();
-    }
-
-    function _callbackData() internal view returns (bytes memory) {
-        return abi.encode(tokenId);
-    }
-
-    function _liquidity() internal view returns (uint128 liquidity) {
-        (,,,,,,, liquidity,,,,) = INonfungiblePositionManager(V3_POSITION_MANAGER).positions(tokenId);
     }
 
     /// @dev How many times the position manager burnt liquidity since `vm.recordLogs()`. This is

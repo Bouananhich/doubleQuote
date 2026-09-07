@@ -6,14 +6,11 @@ import {MAX_TICK} from "midnight/src/libraries/TickLib.sol";
 import {DummyRatifier} from "midnight/test/helpers/DummyRatifier.sol";
 import {Oracle} from "midnight/test/helpers/Oracle.sol";
 
-import {UniswapV3BuyCallback} from "../src/UniswapV3BuyCallback.sol";
-import {UniswapV3BuyCallbackFactory} from "../src/UniswapV3BuyCallbackFactory.sol";
-import {INonfungiblePositionManager, IUniswapV3Pool} from "../src/interfaces/IUniswapV3.sol";
+import {INonfungiblePositionManager} from "../src/interfaces/IUniswapV3.sol";
 import {IUniswapV3BuyCallback} from "../src/interfaces/IUniswapV3BuyCallback.sol";
 
-import {ForkBase} from "./ForkBase.sol";
+import {ParkedPositionBase} from "./ParkedPositionBase.sol";
 import {IERC20Meta} from "./interfaces/IUniswapMinimal.sol";
-import {StubPriceRef} from "./mocks/StubPriceRef.sol";
 
 /// @notice The whole thesis in one transaction: a maker's capital sits in a Uniswap v3 LP position,
 /// a taker fills a fixed-rate offer against **the real Midnight deployment on Base**, and the
@@ -41,9 +38,7 @@ import {StubPriceRef} from "./mocks/StubPriceRef.sol";
 ///     block.
 ///   - **LLTV `0.77e18` and liquidation cursor `0.3e18` are enabled**; `0.5e18` and `1e18` cursors
 ///     are not. The market has to be built from what is enabled, not from what is convenient.
-contract MidnightIntegrationTest is ForkBase {
-    uint256 internal constant MAX_SLIPPAGE_WAD = 0.0001e18;
-
+contract MidnightIntegrationTest is ParkedPositionBase {
     /// @dev Both enabled at `FORK_BLOCK`, and asserted so in `test_theMarketUsesEnabledParameters`.
     uint256 internal constant LLTV = 0.77e18;
     uint256 internal constant LIQUIDATION_CURSOR = 0.3e18;
@@ -53,31 +48,17 @@ contract MidnightIntegrationTest is ForkBase {
     /// (1e36) — hence 1e39. A stub, because the collateral leg is not what this suite is testing.
     uint256 internal constant CBBTC_PRICE = 1e39;
 
-    uint256 internal constant PARKED_USDC = 10_000e6;
-    uint256 internal constant PARKED_USDT = 10_000e6;
-
-    address internal maker = makeAddr("maker");
     address internal taker = makeAddr("taker");
 
     IMidnight internal midnight = IMidnight(MIDNIGHT);
     DummyRatifier internal ratifier;
     Oracle internal oracle;
-    StubPriceRef internal priceRef;
-    UniswapV3BuyCallbackFactory internal factory;
-    UniswapV3BuyCallback internal callback;
 
     Market internal market;
     bytes32 internal marketId;
-    uint256 internal tokenId;
 
     function setUp() public override {
         super.setUp();
-
-        priceRef = new StubPriceRef(1 << 96);
-        factory = new UniswapV3BuyCallbackFactory(MIDNIGHT, V3_POSITION_MANAGER);
-        callback = UniswapV3BuyCallback(
-            factory.createCallback(maker, priceRef, MAX_SLIPPAGE_WAD, POOL_USDC_USDT_100, bytes32(0))
-        );
 
         ratifier = new DummyRatifier();
         oracle = new Oracle();
@@ -99,48 +80,9 @@ contract MidnightIntegrationTest is ForkBase {
         // them. Everything else about the offer is signed, not stored.
         vm.prank(maker);
         midnight.setIsAuthorized(address(ratifier), true, maker);
-
-        tokenId = _mintPosition();
-        vm.prank(maker);
-        INonfungiblePositionManager(V3_POSITION_MANAGER).approve(address(callback), tokenId);
     }
 
     /// HELPERS ///
-
-    function _mintPosition() internal returns (uint256 id) {
-        (, int24 tick,,,,,) = IUniswapV3Pool(POOL_USDC_USDT_100).slot0();
-        int24 spacing = IUniswapV3Pool(POOL_USDC_USDT_100).tickSpacing();
-        int24 lower = ((tick - 50) / spacing) * spacing;
-        int24 upper = ((tick + 50) / spacing) * spacing;
-
-        deal(USDC, maker, PARKED_USDC);
-        deal(USDT, maker, PARKED_USDT);
-
-        vm.startPrank(maker);
-        IERC20Meta(USDC).approve(V3_POSITION_MANAGER, PARKED_USDC);
-        IERC20Meta(USDT).approve(V3_POSITION_MANAGER, PARKED_USDT);
-        (id,,,) = INonfungiblePositionManager(V3_POSITION_MANAGER)
-            .mint(
-                INonfungiblePositionManager.MintParams({
-                    token0: USDC,
-                    token1: USDT,
-                    fee: 100,
-                    tickLower: lower,
-                    tickUpper: upper,
-                    amount0Desired: PARKED_USDC,
-                    amount1Desired: PARKED_USDT,
-                    amount0Min: 0,
-                    amount1Min: 0,
-                    recipient: maker,
-                    deadline: block.timestamp
-                })
-            );
-        vm.stopPrank();
-    }
-
-    function _liquidity() internal view returns (uint128 liquidity) {
-        (,,,,,,, liquidity,,,,) = INonfungiblePositionManager(V3_POSITION_MANAGER).positions(tokenId);
-    }
 
     /// @dev The maker's offer. Buy side, so the maker is the lender and the callback sources the
     /// loan; `tick = MAX_TICK` prices units at par, which keeps the arithmetic legible.
@@ -151,7 +93,7 @@ contract MidnightIntegrationTest is ForkBase {
         offer.expiry = block.timestamp + 1 days;
         offer.tick = MAX_TICK;
         offer.callback = address(callback);
-        offer.callbackData = abi.encode(tokenId);
+        offer.callbackData = _callbackData();
         offer.ratifier = address(ratifier);
         offer.maxUnits = uint128(maxUnits);
         offer.continuousFeeCap = type(uint256).max;
@@ -266,7 +208,7 @@ contract MidnightIntegrationTest is ForkBase {
     /// here, and the case for it has to be made on the volatile venue instead. It is also the wrong
     /// side of correct: a taker who believes the bound gets a reverted transaction, not a bad fill.
     function test_theBoundOverPromisesAgainstWhatActuallySettles() public {
-        uint256 bound = callback.buyerAssetsBound(bytes32(0), market, maker, abi.encode(tokenId));
+        uint256 bound = callback.buyerAssetsBound(bytes32(0), market, maker, _callbackData());
         assertGt(bound, 19_000e6, "bound does not reflect a ~19.9k position");
 
         _collateralize(bound);
