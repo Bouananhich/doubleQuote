@@ -14,6 +14,7 @@ import {IUniswapV3BuyCallback} from "../src/interfaces/IUniswapV3BuyCallback.sol
 
 import {ForkBase} from "./ForkBase.sol";
 import {IERC20Meta} from "./interfaces/IUniswapMinimal.sol";
+import {PoolPusher} from "./mocks/PoolPusher.sol";
 import {StubPriceRef} from "./mocks/StubPriceRef.sol";
 
 /// @notice D2: the v3 happy path, against a real position minted in the real USDC/USDT 0.01% pool
@@ -101,6 +102,15 @@ contract UniswapV3BuyCallbackTest is ForkBase {
 
     function _liquidity() internal view returns (uint128 liquidity) {
         (,,,,,,, liquidity,,,,) = INonfungiblePositionManager(V3_POSITION_MANAGER).positions(tokenId);
+    }
+
+    /// @dev How many times the position manager burnt liquidity since `vm.recordLogs()`. This is
+    /// how a test tells a single sized burn from a burn plus an escalation.
+    function _recordedBurns() internal view returns (uint256 burns) {
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        for (uint256 i; i < logs.length; ++i) {
+            if (logs[i].emitter == V3_POSITION_MANAGER && logs[i].topics[0] == DECREASE_LIQUIDITY_TOPIC) ++burns;
+        }
     }
 
     /// SETUP SANITY ///
@@ -227,14 +237,81 @@ contract UniswapV3BuyCallbackTest is ForkBase {
         vm.recordLogs();
         callback.onBuy(bytes32(0), market, 5_000e6, 0, 0, maker, _callbackData());
 
-        Vm.Log[] memory logs = vm.getRecordedLogs();
-        uint256 burns;
-        for (uint256 i; i < logs.length; ++i) {
-            // IncreaseLiquidity/DecreaseLiquidity on the position manager.
-            if (logs[i].emitter == V3_POSITION_MANAGER && logs[i].topics[0] == DECREASE_LIQUIDITY_TOPIC) ++burns;
-        }
+        assertEq(_recordedBurns(), 1, "fell back to a second burn on the product venue");
+    }
 
-        assertEq(burns, 1, "fell back to a second burn on the product venue");
+    /// @dev The other side of the ceiling: when the first burn genuinely does come up short, the
+    /// escalation has to *finish the fill*, not merely be capped. Nothing else covers this — the
+    /// product venue lands in one round, and the dust fill is supposed to revert.
+    ///
+    /// @dev Triggered through the gap that actually exists. Park and route are independently
+    /// chosen, so nothing holds their prices together, and the sizing values the residual at the
+    /// *parked* pool's spot while the swap executes at the *route* pool's. Route through the 0.05%
+    /// pool — same pair, ~50x thinner — and take most of its USDC out first, and the residual
+    /// fetches far less than the estimate assumed.
+    ///
+    /// @dev Measured at `FORK_BLOCK`, on a 5,000 fill: with the venues agreeing, one burn sources
+    /// 5,011.7 USDC, the ~12 of headroom being the 25bp margin. With the route venue drained, the
+    /// same burn sources 4,441.9 — 11% short, some forty times what the margin covers. Escalation
+    /// then sources 6,934.5 and the fill settles, the surplus landing in the buffer.
+    ///
+    /// @dev Note *why* it settles: doubling the burn doubles the position's **loan-token** side
+    /// (2 x 2,492.7 = 4,985 of the 5,000 on its own), which is the half that does not depend on
+    /// the route venue at all. The second swap barely helps. That is what makes a blind 2x an
+    /// adequate fallback rather than a lucky one — and equally why it is not unbounded, since the
+    /// same doubling is what a dust fill would ride into the whole position.
+    ///
+    /// @dev The burn lands on exactly the ceiling. Escalation does not re-derive a size, it goes
+    /// straight to twice what the fill justified.
+    function test_escalationFinishesAFillTheFirstBurnFellShortOf() public {
+        // Route through the 0.05% pool: same pair, ~50x thinner, and a venue this test can move
+        // without touching the price the sizing reads off the parked pool.
+        UniswapV3BuyCallback drifted = UniswapV3BuyCallback(
+            factory.createCallback(maker, priceRef, MAX_SLIPPAGE_WAD, POOL_USDC_USDT_500, bytes32(uint256(3)))
+        );
+        vm.prank(maker);
+        INonfungiblePositionManager(V3_POSITION_MANAGER).approve(address(drifted), tokenId);
+
+        uint128 liquidityBefore = _liquidity();
+
+        // Baseline, with the two venues still agreeing: one burn, and that burn is the size the
+        // ceiling is a multiple of.
+        uint256 snapshot = vm.snapshotState();
+        vm.recordLogs();
+        vm.prank(MIDNIGHT);
+        drifted.onBuy(bytes32(0), market, 5_000e6, 0, 0, maker, _callbackData());
+        uint256 sized = liquidityBefore - _liquidity();
+        assertEq(_recordedBurns(), 1, "baseline should not already be escalating");
+        vm.revertToState(snapshot);
+
+        _drainRouteVenue(3_000e6);
+
+        vm.recordLogs();
+        vm.prank(MIDNIGHT);
+        bytes32 result = drifted.onBuy(bytes32(0), market, 5_000e6, 0, 0, maker, _callbackData());
+
+        assertEq(_recordedBurns(), 2, "the sized burn should have come up short");
+        assertEq(result, CALLBACK_SUCCESS, "escalation failed to finish the fill");
+        assertGe(IERC20Meta(USDC).balanceOf(address(drifted)), 5_000e6, "under-sourced after escalating");
+
+        uint256 burnt = liquidityBefore - _liquidity();
+        assertEq(burnt, sized * 2, "escalation should burn exactly the ceiling");
+        // Half the position rather than all of it, which is also what makes the equality above
+        // meaningful: had `2 * sized` run past the available liquidity, the ceiling would have
+        // clamped to it and the burn would be `liquidityBefore`.
+        assertGt(_liquidity(), 0, "escalation took the whole position");
+    }
+
+    /// @dev Sells USDT into the route pool, taking most of its USDC with it, so the residual the
+    /// callback is about to sell there fetches far less than the parked pool's spot says it should.
+    /// Same direction the residual itself trades — the honest version of this is a taker moving the
+    /// route venue and then taking.
+    /// @param amountIn Tuned to the pool's depth at `FORK_BLOCK`: enough to push the price well
+    /// past the 25bp the sizing budgets for impact, while leaving the venue able to trade at all.
+    function _drainRouteVenue(uint256 amountIn) internal {
+        PoolPusher pusher = new PoolPusher();
+        deal(USDT, address(pusher), amountIn);
+        pusher.sell(POOL_USDC_USDT_500, false, amountIn);
     }
 
     /// @dev The attack the escalation ceiling exists to stop. A fill of one wei sizes to a burn
