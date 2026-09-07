@@ -12,6 +12,7 @@ import {ModifyLiquidityParams} from "v4-core/types/PoolOperation.sol";
 
 import {UniswapV4BuyCallbackBase} from "./UniswapV4BuyCallbackBase.sol";
 import {IPriceRef} from "./interfaces/IPriceRef.sol";
+import {SourcingMathLib} from "./libraries/SourcingMathLib.sol";
 
 /// @title UniswapV4BuyCallback
 /// @notice Parks a Midnight maker's capital in a Uniswap **v4** position held directly on the
@@ -135,7 +136,7 @@ contract UniswapV4BuyCallback is UniswapV4BuyCallbackBase {
 
         // The sizing models the route fee but not price impact, so it can fall short on a thin
         // venue. Escalate, but only within a bounded multiple of what the fill itself justified.
-        uint256 ceiling = _escalationCeiling(burn, available);
+        uint256 ceiling = SourcingMathLib.escalationCeiling(burn, available);
         if (sourced < shortfall && ceiling > burn) {
             _burnAndSell(parked, residualCurrency, uint128(ceiling - burn));
             sourced = _positiveDelta(loanCurrency);

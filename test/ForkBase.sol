@@ -60,6 +60,12 @@ abstract contract ForkBase is Test {
     uint24 internal constant V4_USDC_USDT_FEE = 100;
     int24 internal constant V4_USDC_USDT_TICK_SPACING = 1;
 
+    /// @dev The same pair on v4 at 0.05% / spacing 10, initialised and at tick 11. Not a venue
+    /// anything parks in — it is the *route* venue a test can move without touching the price the
+    /// burn sizing reads off the parked pool. The v4 counterpart of `POOL_USDC_USDT_500`.
+    uint24 internal constant V4_USDC_USDT_ROUTE_FEE = 500;
+    int24 internal constant V4_USDC_USDT_ROUTE_TICK_SPACING = 10;
+
     function setUp() public virtual {
         vm.createSelectFork(_baseRpcUrl(), FORK_BLOCK);
     }

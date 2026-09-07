@@ -59,10 +59,6 @@ import {SourcingMathLib} from "./libraries/SourcingMathLib.sol";
 contract UniswapV3BuyCallback is UniswapBuyCallbackBase, IUniswapV3BuyCallback, IUniswapV3SwapCallback {
     using SafeCast for uint256;
 
-    /// @dev How far past the sized burn `_sourceLoanToken` may escalate when the estimate came up
-    /// short. See `_escalationCeiling`.
-    uint256 internal constant ESCALATION_FACTOR = 2;
-
     /// @dev Everything about the parked position that either half of the callback needs, read in
     /// one call. `positions` returns twelve values and only these seven are used.
     struct PositionState {
@@ -141,7 +137,7 @@ contract UniswapV3BuyCallback is UniswapBuyCallbackBase, IUniswapV3BuyCallback, 
         // takes the maker's whole LP with it. Proportionality is the invariant — the liquidity
         // burnt must stay tied to the size of the fill, and a fill that cannot justify its own
         // sourcing has to fail closed instead.
-        uint256 ceiling = _escalationCeiling(burn, position.liquidity);
+        uint256 ceiling = SourcingMathLib.escalationCeiling(burn, position.liquidity);
         if (sourced < shortfall && ceiling > burn) {
             _unwind(tokenId, uint128(ceiling - burn));
             _swapWholeResidual(residualToken, loanToken);
@@ -152,15 +148,6 @@ contract UniswapV3BuyCallback is UniswapBuyCallbackBase, IUniswapV3BuyCallback, 
         // a bare `transferFrom` failure — worth two warm balance reads in the contract whose whole
         // point is failing honestly rather than filling badly.
         require(sourced >= shortfall, InsufficientSourced());
-    }
-
-    /// @dev The most liquidity a fill may burn, given what the sizing said it needed. Twice the
-    /// sized burn: ample for the impact the 25bp margin failed to cover — that would have to be
-    /// eight times the margin before it bound — while keeping the burn proportional to the fill, so
-    /// a fill that cannot justify its own sourcing reverts rather than taking the position with it.
-    function _escalationCeiling(uint128 sized, uint128 available) internal pure returns (uint256) {
-        uint256 ceiling = uint256(sized) * ESCALATION_FACTOR;
-        return ceiling < available ? ceiling : available;
     }
 
     /// @dev How much of the position this fill needs. See `SourcingMathLib.liquidityForTarget` for

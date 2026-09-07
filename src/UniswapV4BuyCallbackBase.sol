@@ -38,11 +38,6 @@ abstract contract UniswapV4BuyCallbackBase is UniswapBuyCallbackBase, IUniswapV4
     using TransientStateLibrary for IPoolManager;
     using PoolIdLibrary for PoolKey;
 
-    /// @dev Matches the v3 adapter. The burn a fill may escalate to is capped at this multiple of
-    /// what the sizing asked for, so a fill too small to cover its own rounding reverts rather than
-    /// unwinding the whole position. See `UniswapV3BuyCallback._escalationCeiling`.
-    uint256 internal constant ESCALATION_FACTOR = 2;
-
     /// @inheritdoc IUniswapV4BuyCallback
     address public immutable POOL_MANAGER;
 
@@ -137,11 +132,6 @@ abstract contract UniswapV4BuyCallbackBase is UniswapBuyCallbackBase, IUniswapV4
         if (Currency.unwrap(key.currency0) == loanToken) return (key.currency0, key.currency1, true);
         if (Currency.unwrap(key.currency1) == loanToken) return (key.currency1, key.currency0, false);
         revert LoanCurrencyNotInPool();
-    }
-
-    function _escalationCeiling(uint128 sized, uint128 available) internal pure returns (uint256) {
-        uint256 ceiling = uint256(sized) * ESCALATION_FACTOR;
-        return ceiling < available ? ceiling : available;
     }
 
     /// @dev See `SourcingMathLib.liquidityForTarget`. Venue-agnostic, and shared with v3.

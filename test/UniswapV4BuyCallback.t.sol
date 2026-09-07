@@ -54,10 +54,14 @@ contract UniswapV4BuyCallbackTest is V4ParkedBase {
     /// HELPERS ///
 
     function _parkedLiquidity() internal view returns (uint128) {
+        return _parkedLiquidityOf(address(callback));
+    }
+
+    /// @dev Positions are keyed by owner, so reading one means naming the callback that owns it.
+    function _parkedLiquidityOf(address owner) internal view returns (uint128) {
         return IPoolManager(V4_POOL_MANAGER)
             .getPositionLiquidity(
-                poolKey.toId(),
-                keccak256(abi.encodePacked(address(callback), parked.tickLower, parked.tickUpper, parked.salt))
+                poolKey.toId(), keccak256(abi.encodePacked(owner, parked.tickLower, parked.tickUpper, parked.salt))
             );
     }
 
@@ -131,6 +135,56 @@ contract UniswapV4BuyCallbackTest is V4ParkedBase {
         callback.onBuy(bytes32(0), market, 500e6, 0, 0, maker, _callbackData());
 
         assertEq(_parkedLiquidity(), liquidityBefore, "buffered fill reached the position");
+    }
+
+    /// @dev The other side of the ceiling: when the first burn genuinely does come up short, the
+    /// escalation has to *finish the fill*, not merely be capped. The v3 suite has this; without it
+    /// here, the v4 escalation branch is only ever exercised on its way to a revert.
+    ///
+    /// @dev Triggered the same way, through the gap that actually exists between the park venue and
+    /// the route venue: route through the thinner 0.05% v4 pool and take most of its USDC out
+    /// first, and the residual fetches far less than the sizing assumed.
+    ///
+    /// @dev The burn lands on exactly the ceiling. Escalation does not re-derive a size, it goes
+    /// straight to twice what the fill justified — the same code path, in `SourcingMathLib`, that
+    /// makes a dust fill revert.
+    function test_escalationFinishesAFillTheFirstBurnFellShortOf() public {
+        UniswapV4BuyCallback drifted = UniswapV4BuyCallback(
+            factory.createCallback(maker, priceRef, MAX_SLIPPAGE_WAD, usdcUsdtRouteKey(), bytes32(uint256(7)))
+        );
+
+        // The custodial adapter can only burn a position it owns, so this one has to park for
+        // itself. Half the fixture's size, since the pool has to hold both.
+        deal(USDC, maker, PARKED_USDC);
+        deal(USDT, maker, PARKED_USDT);
+        vm.startPrank(maker);
+        IERC20Meta(USDC).approve(address(drifted), type(uint256).max);
+        IERC20Meta(USDT).approve(address(drifted), type(uint256).max);
+        drifted.park(parked, _liquidityFor(PARKED_USDC, PARKED_USDT));
+        vm.stopPrank();
+
+        uint128 liquidityBefore = _parkedLiquidityOf(address(drifted));
+
+        // Baseline, with the venues still agreeing: this is the size the ceiling is a multiple of.
+        uint256 snapshot = vm.snapshotState();
+        vm.prank(MIDNIGHT);
+        drifted.onBuy(bytes32(0), market, 400e6, 0, 0, maker, _callbackData());
+        uint256 sized = liquidityBefore - _parkedLiquidityOf(address(drifted));
+        assertGt(sized, 0, "baseline burnt nothing, so the ceiling assertion below would be vacuous");
+        vm.revertToState(snapshot);
+
+        _drainRouteVenue(ROUTE_DRAIN);
+
+        vm.prank(MIDNIGHT);
+        bytes32 result = drifted.onBuy(bytes32(0), market, 400e6, 0, 0, maker, _callbackData());
+
+        assertEq(result, CALLBACK_SUCCESS, "escalation failed to finish the fill");
+        assertGe(IERC20Meta(USDC).balanceOf(address(drifted)), 400e6, "under-sourced after escalating");
+
+        uint256 burnt = liquidityBefore - _parkedLiquidityOf(address(drifted));
+        assertGt(burnt, sized, "the sized burn should have come up short");
+        assertEq(burnt, sized * 2, "escalation should burn exactly the ceiling");
+        assertGt(_parkedLiquidityOf(address(drifted)), 0, "escalation took the whole position");
     }
 
     /// @dev Same ceiling as v3, and it has to hold here too: a fill too small to source its own

@@ -15,6 +15,7 @@ import {Vm} from "forge-std/Vm.sol";
 import {ForkBase} from "./ForkBase.sol";
 import {IERC20Meta, IPermit2} from "./interfaces/IUniswapMinimal.sol";
 import {StubPriceRef} from "./mocks/StubPriceRef.sol";
+import {V4PoolPusher} from "./mocks/V4PoolPusher.sol";
 
 /// @notice What both v4 suites start from: the real USDC/USDT 0.01% v4 pool, a range around the
 /// live tick, and a maker holding the tokens to park.
@@ -38,6 +39,10 @@ abstract contract V4ParkedBase is ForkBase {
 
     /// @dev `Transfer(address,address,uint256)`.
     bytes32 internal constant TRANSFER_TOPIC = 0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef;
+
+    /// @dev Found by sweeping: enough USDT into the route venue to push the residual's realised
+    /// price well past the 25bp sizing margin, while leaving the pool able to trade.
+    uint256 internal constant ROUTE_DRAIN = 3_000e6;
 
     uint256 internal constant PARKED_USDC = 2_000e6;
     uint256 internal constant PARKED_USDT = 2_000e6;
@@ -78,6 +83,29 @@ abstract contract V4ParkedBase is ForkBase {
             tickSpacing: V4_USDC_USDT_TICK_SPACING,
             hooks: IHooks(address(0))
         });
+    }
+
+    /// @dev The thinner v4 pool on the same pair, used only as a route venue.
+    function usdcUsdtRouteKey() internal pure returns (PoolKey memory) {
+        return PoolKey({
+            currency0: Currency.wrap(USDC),
+            currency1: Currency.wrap(USDT),
+            fee: V4_USDC_USDT_ROUTE_FEE,
+            tickSpacing: V4_USDC_USDT_ROUTE_TICK_SPACING,
+            hooks: IHooks(address(0))
+        });
+    }
+
+    /// @dev Sells USDT into the route venue, taking most of its USDC with it, so the residual a
+    /// callback is about to sell there fetches far less than the parked pool's spot says it should.
+    /// Same direction the residual itself trades — the honest version of this is a taker moving the
+    /// route venue and then taking.
+    /// @param amountIn Tuned to the pool's depth at `FORK_BLOCK`: enough to push past the 25bp the
+    /// sizing budgets for impact, while leaving the venue able to trade at all.
+    function _drainRouteVenue(uint256 amountIn) internal {
+        V4PoolPusher pusher = new V4PoolPusher(V4_POOL_MANAGER);
+        deal(USDT, address(pusher), amountIn);
+        pusher.sell(usdcUsdtRouteKey(), false, amountIn);
     }
 
     /// @dev Largest liquidity the two amounts can fund over the parked range, the way a position

@@ -156,6 +156,50 @@ contract UniswapV4NftBuyCallbackTest is V4ParkedBase {
         assertEq(_liquidity(), liquidityBefore, "buffered fill reached the position");
     }
 
+    /// @dev The escalation branch finishing a fill rather than being capped — the counterpart of
+    /// `test_aDustFillCannotUnwindThePosition`, and of the same test on the other two adapters.
+    /// Both halves of the branch have to be covered on every adapter that has one.
+    ///
+    /// @dev Here the escalation costs a second full round-trip through the position manager, not
+    /// just a second burn: two decreases, two unlocks of our own, four residual transfers. That is
+    /// the non-custodial path's worst case, and it is worth seeing settle.
+    function test_escalationFinishesAFillTheFirstBurnFellShortOf() public {
+        UniswapV4NftBuyCallback drifted = UniswapV4NftBuyCallback(
+            factory.createCallback(maker, priceRef, MAX_SLIPPAGE_WAD, usdcUsdtRouteKey(), bytes32(uint256(7)))
+        );
+        vm.prank(maker);
+        IV4PositionManager(V4_POSITION_MANAGER).approve(address(drifted), tokenId);
+
+        uint128 liquidityBefore = _liquidity();
+
+        // Baseline, venues still agreeing: the size the ceiling is a multiple of.
+        uint256 snapshot = vm.snapshotState();
+        vm.prank(MIDNIGHT);
+        drifted.onBuy(bytes32(0), market, 400e6, 0, 0, maker, _callbackData());
+        uint256 sized = liquidityBefore - _liquidity();
+        assertGt(sized, 0, "baseline burnt nothing, so the ceiling assertion below would be vacuous");
+        vm.revertToState(snapshot);
+
+        _drainRouteVenue(ROUTE_DRAIN);
+
+        vm.recordLogs();
+        vm.prank(MIDNIGHT);
+        bytes32 result = drifted.onBuy(bytes32(0), market, 400e6, 0, 0, maker, _callbackData());
+
+        assertEq(result, CALLBACK_SUCCESS, "escalation failed to finish the fill");
+        assertGe(IERC20Meta(USDC).balanceOf(address(drifted)), 400e6, "under-sourced after escalating");
+
+        uint256 burnt = liquidityBefore - _liquidity();
+        assertGt(burnt, sized, "the sized burn should have come up short");
+        assertEq(burnt, sized * 2, "escalation should burn exactly the ceiling");
+        assertGt(_liquidity(), 0, "escalation took the whole position");
+
+        // Two rounds, and each one moves the residual out and back. The custodial adapter's
+        // equivalent escalation moves it zero times either way.
+        assertEq(_residualTransfersTouching(address(drifted)), 4, "escalation should have cost two round-trips");
+        assertEq(IV4PositionManager(V4_POSITION_MANAGER).ownerOf(tokenId), maker, "maker lost the NFT");
+    }
+
     function test_aDustFillCannotUnwindThePosition() public {
         uint128 liquidityBefore = _liquidity();
 

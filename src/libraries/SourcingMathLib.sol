@@ -43,6 +43,10 @@ library SourcingMathLib {
     /// impact term is D5/D6.
     uint256 internal constant IMPACT_MARGIN_BPS = 25;
 
+    /// @dev How far past the sized burn a caller may escalate when the estimate came up short.
+    /// See `escalationCeiling`.
+    uint256 internal constant ESCALATION_FACTOR = 2;
+
     /// @notice Token amounts a position of `liquidity` over `[sqrtLower, sqrtUpper]` is worth at
     /// `sqrtPriceX96`.
     /// @dev Rounds down: this feeds a bound that must never over-promise.
@@ -124,6 +128,29 @@ library SourcingMathLib {
         uint256 needed = FullMath.mulDivRoundingUp(liquidity, targetWithMargin, sourceable);
 
         return needed >= liquidity ? liquidity : uint128(needed);
+    }
+
+    /// @notice The most liquidity a fill may burn in total, given what the sizing said it needed.
+    ///
+    /// @dev Twice the sized burn: ample for the impact `IMPACT_MARGIN_BPS` failed to cover — that
+    /// would have to run to eight times the margin before this binds on an honest fill — while
+    /// keeping the burn proportional to the fill.
+    ///
+    /// @dev **Proportionality is the invariant.** Escalating straight to the remaining liquidity
+    /// means any fill too small to survive the rounding in `liquidityForTarget` unwinds the entire
+    /// position: a take of one wei sizes to a burn that yields zero tokens, comes up short, and
+    /// takes the maker's whole LP with it. A fill that cannot justify its own sourcing has to fail
+    /// closed instead. See `JOURNAL.md`, "A one-wei take could destroy the whole position".
+    ///
+    /// @dev Lives here rather than in an adapter because it is arithmetic on liquidity units and
+    /// nothing else — the same answer on v3, on a v4 position owned by the callback, and on a v4
+    /// position the maker holds. All three call it.
+    ///
+    /// @param sized What `liquidityForTarget` asked for.
+    /// @param available The position's whole liquidity, which the ceiling can never exceed.
+    function escalationCeiling(uint128 sized, uint128 available) internal pure returns (uint256) {
+        uint256 ceiling = uint256(sized) * ESCALATION_FACTOR;
+        return ceiling < available ? ceiling : available;
     }
 
     /// @notice Value of `amount1` of token1, denominated in token0, at `sqrtPriceX96`.

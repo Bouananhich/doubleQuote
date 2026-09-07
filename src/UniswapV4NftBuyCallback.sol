@@ -9,6 +9,7 @@ import {PoolKey} from "v4-core/types/PoolKey.sol";
 
 import {UniswapV4BuyCallbackBase} from "./UniswapV4BuyCallbackBase.sol";
 import {IPriceRef} from "./interfaces/IPriceRef.sol";
+import {SourcingMathLib} from "./libraries/SourcingMathLib.sol";
 import {IV4PositionManager, V4Actions, V4PositionInfo} from "./interfaces/IV4PositionManager.sol";
 
 /// @title UniswapV4NftBuyCallback
@@ -85,7 +86,7 @@ contract UniswapV4NftBuyCallback is UniswapV4BuyCallbackBase {
         uint256 sourced = IERC20Extended(loanToken).balanceOf(address(this)) - heldBefore;
 
         // Same bounded escalation as the other two adapters.
-        uint256 ceiling = _escalationCeiling(burn, position.available);
+        uint256 ceiling = SourcingMathLib.escalationCeiling(burn, position.available);
         if (sourced < shortfall && ceiling > burn) {
             _decreaseAndSell(tokenId, position, loanToken, uint128(ceiling - burn));
             sourced = IERC20Extended(loanToken).balanceOf(address(this)) - heldBefore;
