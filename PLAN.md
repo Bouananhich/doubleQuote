@@ -50,10 +50,25 @@ Sized partial unwind. **77/77.**
 - Dust-take defence verified: 20 consecutive dust takes never touch a position with a funded
   buffer. It does require the buffer to be funded — a maker policy, not automatic.
 
-**Next, in order:**
-1. Fork `BlueBuyCallbackIntegrationTest` — deferred from D1 on purpose. It needs a real offer taken
-   against real Midnight, which is now finally possible.
-2. Then D4 (v4 adapter) as scheduled.
+## The Midnight integration suite — done (7 Sep)
+
+`test/MidnightIntegration.t.sol`. The D1 deferral, closed: a real offer taken against the **deployed
+Midnight on Base**, sourced out of a real v3 position. **87/87.**
+
+- Park → offer → take → atomic unwind + settle, in one transaction on the taker's gas. The maker
+  keeps the NFT, ~75% of the position survives a 25% fill, and the surplus lands in the buffer,
+  where a second take of 10 USDC is served without touching Uniswap at all.
+- Binding the deployed instance rather than deploying one (as upstream does) immediately surfaced
+  constraints a self-configured test would have missed — `tickSpacingSetter` is `address(0)`, so
+  markets keep spacing 4 and offer ticks must divide by it. See `JOURNAL.md`.
+- **Measured: the naive bound over-promises by 0.63bp** (19,872.71 quoted vs 19,871.46 sourceable).
+  That is much closer than D5/D6 were scoped against. The case for the tick walk now has to be made
+  on the volatile venue — see `JOURNAL.md`, and treat it as a live risk to the D5/D6 framing.
+- Upstream's other two tests are Blue-specific (bound capped by available liquidity, by Blue's
+  balance under a flash loan). The v3 analogue of the first is already in
+  `UniswapV3BuyCallback.t.sol`; the second has no counterpart.
+
+**Next:** D4 (v4 adapter) as scheduled.
 
 **Open, needs a decision:** the repo has no root `LICENSE` file. The forked Morpho periphery is
 GPL-2.0-or-later, so the derivative is too; the file headers already say so but the repo does not.
@@ -94,7 +109,7 @@ The prep window (Mon 31 Aug → Thu 3 Sep) was not used. These are prerequisites
 
 | Day | Deliverable |
 |-----|-------------|
-| **D1** (Fri 4) | Public repo ✅, `FRICTION.log` started ✅, fork-Base harness green ✅. `UniswapBuyCallbackBase` skeleton + factory ✅. Blue's two unit suites forked ✅; the integration suite waits on the v3 adapter. |
+| **D1** (Fri 4) | Public repo ✅, `FRICTION.log` started ✅, fork-Base harness green ✅. `UniswapBuyCallbackBase` skeleton + factory ✅. Blue's two unit suites forked ✅; the integration suite landed 7 Sep ✅. |
 | **D2** (Sat 5) | **v3 happy path** ✅. Park in the NFT position; `onBuy` does `decreaseLiquidity` then `collect`, swaps residual, approves Midnight, returns `CALLBACK_SUCCESS`. 16 green fork tests; custody settled non-custodial. |
 | **D3** (Sun 6) | Loan-token buffer ✅ (landed D1) + partial unwind ✅. Only touch the LP when the buffer can't cover the fill, and then only for the fill's share. Fixes dust-grief bleed; costs ~18k gas rather than saving it. |
 | **D4** (Mon 7) | **v4 happy path.** Whole unwind inside one `PoolManager.unlock()` — `modifyLiquidity`, swap residual, settle one netted delta. Naive `buyerAssetsBound` on both. |
