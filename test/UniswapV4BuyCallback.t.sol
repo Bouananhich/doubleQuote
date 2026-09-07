@@ -16,85 +16,34 @@ import {UniswapV4BuyCallbackFactory} from "../src/UniswapV4BuyCallbackFactory.so
 import {IMidnightBuyCallback} from "../src/interfaces/IMidnightBuyCallback.sol";
 import {IUniswapV4BuyCallback} from "../src/interfaces/IUniswapV4BuyCallback.sol";
 
-import {ForkBase} from "./ForkBase.sol";
+import {V4ParkedBase} from "./V4ParkedBase.sol";
 import {IERC20Meta} from "./interfaces/IUniswapMinimal.sol";
-import {StubPriceRef} from "./mocks/StubPriceRef.sol";
 
 /// @notice D4: the v4 happy path, against the real USDC/USDT 0.01% v4 pool on a Base fork.
-///
-/// @dev **Sized to the venue, not to v3.** The v4 pool holds 5.43e11 of active liquidity against
-/// the v3 pool's 3.93e14 — 724x thinner at this block. Parking 10k+10k here, as the v3 suite does,
-/// would make this contract's position seven times the entire pool, and every residual swap would
-/// move the price further than the 25bp sizing margin covers. So the fixture parks 2k+2k and fills
-/// in the hundreds. That is not a workaround: it is what the venue can actually absorb, and it is
-/// the reason the v3-vs-v4 gas comparison has to be read as "same operation, different plumbing"
-/// rather than "same trade".
 ///
 /// @dev Custody differs from v3 by necessity — `modifyLiquidity` keys positions by `msg.sender`,
 /// so the callback owns this one. `test_onlyTheMakerCanMoveTheParkedCapital` and
 /// `test_unparkAlwaysPaysTheMaker` are what stands in for v3's "the maker keeps the NFT".
-contract UniswapV4BuyCallbackTest is ForkBase {
+contract UniswapV4BuyCallbackTest is V4ParkedBase {
     using StateLibrary for IPoolManager;
     using PoolIdLibrary for PoolKey;
 
-    uint256 internal constant MAX_SLIPPAGE_WAD = 0.0001e18;
-
-    /// @dev Deliberately small; see the note on this contract.
-    uint256 internal constant PARKED_USDC = 2_000e6;
-    uint256 internal constant PARKED_USDT = 2_000e6;
-
-    address internal maker = makeAddr("maker");
-    StubPriceRef internal priceRef;
     UniswapV4BuyCallbackFactory internal factory;
     UniswapV4BuyCallback internal callback;
-    Market internal market;
-
-    PoolKey internal poolKey;
     UniswapV4BuyCallback.Parked internal parked;
 
     function setUp() public override {
         super.setUp();
 
-        poolKey = _usdcUsdtKey();
-
-        priceRef = new StubPriceRef(1 << 96);
         factory = new UniswapV4BuyCallbackFactory(MIDNIGHT, V4_POOL_MANAGER);
         callback = UniswapV4BuyCallback(factory.createCallback(maker, priceRef, MAX_SLIPPAGE_WAD, poolKey, bytes32(0)));
 
-        market.chainId = block.chainid;
-        market.midnight = MIDNIGHT;
-        market.loanToken = USDC;
+        parked =
+            UniswapV4BuyCallback.Parked({key: poolKey, tickLower: tickLower, tickUpper: tickUpper, salt: bytes32(0)});
 
-        _park();
-    }
-
-    /// HELPERS ///
-
-    /// @dev USDC sorts below native USDT, so USDC is currency0 and the residual is currency1 —
-    /// the same orientation as the v3 fixture.
-    function _usdcUsdtKey() internal pure returns (PoolKey memory) {
-        return PoolKey({
-            currency0: Currency.wrap(USDC),
-            currency1: Currency.wrap(USDT),
-            fee: V4_USDC_USDT_FEE,
-            tickSpacing: V4_USDC_USDT_TICK_SPACING,
-            hooks: IHooks(address(0))
-        });
-    }
-
-    /// @dev Parks around the live tick, the range a stable-pair LP actually earns in.
-    function _park() internal {
-        (, int24 tick,,) = IPoolManager(V4_POOL_MANAGER).getSlot0(poolKey.toId());
-        parked = UniswapV4BuyCallback.Parked({
-            key: poolKey,
-            tickLower: ((tick - 50) / poolKey.tickSpacing) * poolKey.tickSpacing,
-            tickUpper: ((tick + 50) / poolKey.tickSpacing) * poolKey.tickSpacing,
-            salt: bytes32(0)
-        });
-
-        deal(USDC, maker, PARKED_USDC);
-        deal(USDT, maker, PARKED_USDT);
-
+        // Parking here is a call on the callback, not a mint: the position it burns has to be one
+        // it owns. Plain ERC-20 approvals, since the tokens go to the pool manager directly rather
+        // than through Permit2.
         vm.startPrank(maker);
         IERC20Meta(USDC).approve(address(callback), type(uint256).max);
         IERC20Meta(USDT).approve(address(callback), type(uint256).max);
@@ -102,19 +51,7 @@ contract UniswapV4BuyCallbackTest is ForkBase {
         vm.stopPrank();
     }
 
-    /// @dev Largest liquidity the two amounts can fund over the parked range, the same way a
-    /// position manager would compute it.
-    function _liquidityFor(uint256 amount0, uint256 amount1) internal view returns (uint128) {
-        (uint160 sqrtPriceX96,,,) = IPoolManager(V4_POOL_MANAGER).getSlot0(poolKey.toId());
-        uint160 lower = TickMath.getSqrtPriceAtTick(parked.tickLower);
-        uint160 upper = TickMath.getSqrtPriceAtTick(parked.tickUpper);
-
-        // In range, so both sides bind; take the smaller.
-        uint256 liquidity0 = (amount0 * ((uint256(sqrtPriceX96) * upper) / (1 << 96))) / (upper - sqrtPriceX96);
-        uint256 liquidity1 = (amount1 * (1 << 96)) / (sqrtPriceX96 - lower);
-
-        return uint128(liquidity0 < liquidity1 ? liquidity0 : liquidity1);
-    }
+    /// HELPERS ///
 
     function _parkedLiquidity() internal view returns (uint128) {
         return IPoolManager(V4_POOL_MANAGER)
@@ -156,9 +93,14 @@ contract UniswapV4BuyCallbackTest is ForkBase {
     /// @dev The netting claim, asserted rather than described: the residual token never lands on
     /// this contract. In v3 the same settlement leaves USDT here between `collect` and `swap`.
     function test_theResidualIsNeverHeld() public {
+        vm.recordLogs();
         vm.prank(MIDNIGHT);
         callback.onBuy(bytes32(0), market, 500e6, 0, 0, maker, _callbackData());
 
+        // Not "ends up with none of it" — never touches it. The burn credits a residual delta and
+        // the swap consumes the same delta, so no ERC-20 transfer of it ever happens. The NFT
+        // adapter's equivalent test asserts two.
+        assertEq(_residualTransfersTouching(address(callback)), 0, "residual moved as tokens, not as a delta");
         assertEq(IERC20Meta(USDT).balanceOf(address(callback)), 0, "residual was held, not netted");
     }
 
@@ -314,7 +256,7 @@ contract UniswapV4BuyCallbackTest is ForkBase {
 
     /// @dev The route venue is part of the safety envelope, so the address has to commit to it.
     function test_theRouteVenueIsPartOfTheDeploymentKey() public {
-        PoolKey memory otherRoute = _usdcUsdtKey();
+        PoolKey memory otherRoute = usdcUsdtKey();
         otherRoute.fee = 500;
         otherRoute.tickSpacing = 10;
 

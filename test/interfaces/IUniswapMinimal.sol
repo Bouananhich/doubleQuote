@@ -18,6 +18,14 @@ interface IPositionManagerV4 {
     function nextTokenId() external view returns (uint256);
 }
 
+/// @dev v4's `PositionManager` pulls payment through Permit2 rather than a plain `transferFrom`,
+/// so minting a v4 position needs a two-step approval: the ERC-20 approves Permit2, then Permit2
+/// approves the position manager. Only the test fixture needs this — the adapters never pay *into*
+/// the position manager, they only decrease.
+interface IPermit2 {
+    function approve(address token, address spender, uint160 amount, uint48 expiration) external;
+}
+
 interface IERC20Meta {
     function symbol() external view returns (string memory);
     function decimals() external view returns (uint8);

@@ -696,3 +696,33 @@ Two consequences worth carrying forward:
 - **It is feedback.** A developer choosing where to build against Uniswap on Base today would find
   the stable-pair liquidity still overwhelmingly in v3. That belongs in `FEEDBACK.md`, stated as a
   measurement rather than a complaint.
+
+## 2026-09-07 (D4) — Two v4 adapters, and the seam between them
+
+`UniswapV4BuyCallbackBase` holds what both share: the route venue immutables, the residual swap,
+delta accounting, the escalation ceiling, the burn sizing and the naive bound. What differs is only
+*where the liquidity lives and how it is burnt* — which is the smallest possible difference for two
+adapters that exist to be compared.
+
+Extracted at the second use rather than up front. Writing the custodial one first and pulling the
+base out when the NFT one arrived meant the seam was drawn around code that existed, not code that
+was imagined. Risk #1 in `PLAN.md` says that if two adapters share less than about two-thirds of
+their logic the abstraction is wrong; these share more than that, and the check is that
+`UniswapV4NftBuyCallback` is 10.5KB against the base's contribution to both.
+
+**The netting difference is now a measurement rather than a claim.** Counting ERC-20 `Transfer`
+events on the residual token that touch the callback during one settlement:
+
+| | residual transfers | gas, 500 USDC fill |
+|---|---|---|
+| `UniswapV4BuyCallback` (custodial) | **0** | 296,485 |
+| `UniswapV4NftBuyCallback` (NFT) | **2** | 352,065 |
+
+Zero is the interesting number. The custodial adapter does not "end up holding none of the
+residual" — it never touches it. The burn credits a delta, the swap consumes the same delta, and no
+transfer of the residual token happens at any point in the settlement. That is the thing v4 can do
+and v3 structurally cannot, and it is worth exactly one adapter.
+
+The 55,580 gas between them is the price of the maker keeping their NFT. Both numbers belong in
+D11's table, and the table needs three columns, not two — v3, v4-NFT, v4-direct — because
+v3-vs-v4-direct alone conflates the version difference with the custody difference.

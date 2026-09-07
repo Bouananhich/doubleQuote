@@ -26,6 +26,10 @@ abstract contract ForkBase is Test {
     address internal constant V4_POOL_MANAGER = 0x498581fF718922c3f8e6A244956aF099B2652b2b;
     address internal constant V4_POSITION_MANAGER = 0x7C5f5A4bBd8fD63184577525326123B519429bDc;
 
+    /// @dev Canonical Permit2, the same address on every chain. v4's `PositionManager` pulls
+    /// payment through it, so a fixture that mints a v4 position needs a two-step approval.
+    address internal constant PERMIT2 = 0x000000000022D473030F116dDEE9F6B43aC78BA3;
+
     // --- Tokens ---
 
     address internal constant USDC = 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913;
