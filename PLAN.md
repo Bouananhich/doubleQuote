@@ -61,9 +61,9 @@ Midnight on Base**, sourced out of a real v3 position. **87/87.**
 - Binding the deployed instance rather than deploying one (as upstream does) immediately surfaced
   constraints a self-configured test would have missed — `tickSpacingSetter` is `address(0)`, so
   markets keep spacing 4 and offer ticks must divide by it. See `JOURNAL.md`.
-- **Measured: the naive bound over-promises by 0.63bp** (19,872.71 quoted vs 19,871.46 sourceable).
-  That is much closer than D5/D6 were scoped against. The case for the tick walk now has to be made
-  on the volatile venue — see `JOURNAL.md`, and treat it as a live risk to the D5/D6 framing.
+- **Measured: the naive bound over-promised by 0.63bp** (19,872.71 quoted vs 19,871.46 sourceable).
+  *Resolved on D5, and against expectation* — the single-step bound is exact to the wei here, and
+  the reading that "the stable venue leaves D5 nothing to win" was wrong. See the D5 section.
 - Upstream's other two tests are Blue-specific (bound capped by available liquidity, by Blue's
   balance under a flash loan). The v3 analogue of the first is already in
   `UniswapV3BuyCallback.t.sol`; the second has no counterpart.
@@ -93,12 +93,32 @@ difference "v4". Full reasoning in `JOURNAL.md`.
 **Cost:** this ran past the one day D4 had, as flagged before starting. It comes out of slack; if it
 reaches D5, the tick walk is what gives, per risk #2.
 
-**Next:** D5 — but see the D5/D6 caveat under the integration suite above. The naive bound is
-already within 0.63bp on the stable venue, so the single-step version has to justify itself on the
-volatile venue.
-
 **Open, needs a decision:** the repo has no root `LICENSE` file. The forked Morpho periphery is
 GPL-2.0-or-later, so the derivative is too; the file headers already say so but the repo does not.
+
+## D5 — done
+
+`SourcingMathLib.boundBySlippage`: simulate the unwind, bisect on how much liquidity to burn, subject
+to the slippage budget. Live on all three adapters. **145/145.**
+
+- **The bound is exact.** Against a real `take()` on the deployed Midnight, the quote is
+  19,871.458852 USDC and the largest settleable fill is 19,871.458852 — headroom **zero, to the
+  wei**, found by bisection and pinned in both directions (`bound` fills, `bound + 1` reverts).
+- **The D4 caveat was the wrong reading.** "The naive bound is already within 0.63bp, so D5 has
+  little to win" mistook *near* for *correct*. A 0.63bp optimistic bound hands a taker a reverted
+  transaction; the routing layer is asynchronous by construction, which is why the bound exists.
+- **v4 is where it bites.** The parked 2k+2k is **59.24% of that pool's active liquidity**, so the
+  active-share cap binds *and* the 1bp budget cuts the quote to **245.21 USDC** against ~3,950 of
+  paper value. Same pair, same fee tier, opposite answer from v3 — depth relative to the maker is
+  the whole variable, and that contrast is the demo.
+- Both `bound.py` findings implemented rather than approximated, and both had to be *generalised*:
+  park and route are independently chosen here, so a burn thins the route venue only when it is the
+  same pool and in range. `bound.py` models one pool and could assume it.
+
+**Next:** D6 — the multi-tick walk. The single step assumes the route venue's liquidity continues in
+the direction of travel; on the stable venue it does, which is why the answer is exact. Risk #2 says
+this is what gives if D4's overrun catches up, and the fallback is now much stronger than it was:
+the shipped bound is exact on the venue the demo runs on.
 
 Build order is **v3 first, v4 second, both shipped**. v3 is load-bearing — its native
 `observe()` makes the price-reference work straightforward. If a day goes missing, v4 is cut,
@@ -127,8 +147,8 @@ The prep window (Mon 31 Aug → Thu 3 Sep) was not used. These are prerequisites
 - [x] **Pick the pools.** Both pinned in `test/ForkBase.sol` at block 50,875,000. Stable venue is
       USDC / **native USDT** (`0xfde4…9bb2`) 0.01% — ~50× deeper than the 0.05% pool. Stress venue
       is cbBTC/USDC 0.05%.
-- [ ] **Port `bound.py` reasoning into a Solidity sketch.** *(`bound.py` recovered — present at the
-      repo root but untracked, hence D1 reading it as missing. Commit it. The port itself is D5/D6.)*
+- [x] **Port `bound.py` reasoning into a Solidity sketch.** Done on D5 for the single-step half:
+      `boundBySlippage`, both findings, and the bisection. The tick walk is D6.
 
 ---
 
@@ -140,7 +160,7 @@ The prep window (Mon 31 Aug → Thu 3 Sep) was not used. These are prerequisites
 | **D2** (Sat 5) | **v3 happy path** ✅. Park in the NFT position; `onBuy` does `decreaseLiquidity` then `collect`, swaps residual, approves Midnight, returns `CALLBACK_SUCCESS`. 16 green fork tests; custody settled non-custodial. |
 | **D3** (Sun 6) | Loan-token buffer ✅ (landed D1) + partial unwind ✅. Only touch the LP when the buffer can't cover the fill, and then only for the fill's share. Fixes dust-grief bleed; costs ~18k gas rather than saving it. |
 | **D4** (Mon 7) | **v4 happy path.** Whole unwind inside one `PoolManager.unlock()` — `modifyLiquidity`, swap residual, settle one netted delta. Naive `buyerAssetsBound` on both. |
-| **D5** (Tue 8) | `SourcingMathLib` single-step version — exact for the stable pool, where a small residual never leaves the active tick range. Include the `max_share` liquidity cap. |
+| **D5** (Tue 8) | `SourcingMathLib` single-step version ✅ — exact to the wei on the stable pool against a real `take()`. `max_share` cap included, and it binds on v4. |
 | **D6** (Wed 9) | Multi-tick walk (`TickBitmap` + `computeSwapStep`) for the volatile pool. Bisection on top. Cross-check against `bound.py` outputs. |
 | **D7** (Thu 10) | **The griefing test**, on v3. Attacker moves the pool, takes the offer, callback swaps into the manufactured price. Quantify the maker's loss. |
 

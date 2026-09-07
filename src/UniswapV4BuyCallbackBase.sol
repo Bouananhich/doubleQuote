@@ -9,7 +9,7 @@ import {StateLibrary} from "v4-core/libraries/StateLibrary.sol";
 import {TickMath} from "v4-core/libraries/TickMath.sol";
 import {TransientStateLibrary} from "v4-core/libraries/TransientStateLibrary.sol";
 import {Currency} from "v4-core/types/Currency.sol";
-import {PoolIdLibrary} from "v4-core/types/PoolId.sol";
+import {PoolId, PoolIdLibrary} from "v4-core/types/PoolId.sol";
 import {PoolKey} from "v4-core/types/PoolKey.sol";
 import {SwapParams} from "v4-core/types/PoolOperation.sol";
 
@@ -158,21 +158,41 @@ abstract contract UniswapV4BuyCallbackBase is UniswapBuyCallbackBase, IUniswapV4
         );
     }
 
-    /// @dev The naive bound: position amounts at spot plus the residual converted at spot. Both
-    /// adapters over-promise identically, which is the point of sharing it.
+    /// @dev **The single-step bound, D5.** Simulates the unwind and bisects on how much liquidity
+    /// to burn, subject to `MAX_SLIPPAGE_WAD`. See `SourcingMathLib.boundBySlippage`.
+    ///
+    /// @dev Both v4 adapters answer identically, which is the point of sharing it — and so does v3,
+    /// because the model is venue-agnostic. Where the position physically lives changes how it is
+    /// burnt, not what it is worth.
     function _boundFor(PoolKey memory key, int24 tickLower, int24 tickUpper, uint128 liquidity, bool loanIsCurrency0)
         internal
         view
         returns (uint256)
     {
+        Currency residualCurrency = loanIsCurrency0 ? key.currency1 : key.currency0;
+
+        // The residual has to be sellable on the immutable route venue or the unwind reverts, so
+        // the honest bound in that case is zero, not the position's paper value.
+        if (!(residualCurrency == ROUTE_CURRENCY0) && !(residualCurrency == ROUTE_CURRENCY1)) return 0;
+
+        PoolKey memory route = routeKey();
         (uint160 sqrtPriceX96,,,) = IPoolManager(POOL_MANAGER).getSlot0(key.toId());
+        (uint160 routeSqrtPriceX96,,,) = IPoolManager(POOL_MANAGER).getSlot0(route.toId());
 
-        (uint256 amount0, uint256 amount1) = SourcingMathLib.amountsForLiquidity(
-            sqrtPriceX96, TickMath.getSqrtPriceAtTick(tickLower), TickMath.getSqrtPriceAtTick(tickUpper), liquidity
+        return SourcingMathLib.boundBySlippage(
+            SourcingMathLib.BoundParams({
+                sqrtPriceX96: sqrtPriceX96,
+                sqrtLowerX96: TickMath.getSqrtPriceAtTick(tickLower),
+                sqrtUpperX96: TickMath.getSqrtPriceAtTick(tickUpper),
+                liquidity: liquidity,
+                loanIsToken0: loanIsCurrency0,
+                routeSqrtPriceX96: routeSqrtPriceX96,
+                routeLiquidity: IPoolManager(POOL_MANAGER).getLiquidity(route.toId()),
+                routeFeePips: ROUTE_FEE,
+                residualIsRouteToken0: residualCurrency == ROUTE_CURRENCY0,
+                routeIsParkVenue: PoolId.unwrap(key.toId()) == PoolId.unwrap(route.toId()),
+                maxSlippageWad: MAX_SLIPPAGE_WAD
+            })
         );
-
-        return loanIsCurrency0
-            ? amount0 + SourcingMathLib.quote1For0(amount1, sqrtPriceX96)
-            : amount1 + SourcingMathLib.quote0For1(amount0, sqrtPriceX96);
     }
 }

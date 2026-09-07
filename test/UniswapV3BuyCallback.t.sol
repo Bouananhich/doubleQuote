@@ -305,13 +305,34 @@ contract UniswapV3BuyCallbackTest is ParkedPositionBase {
 
     /// QUOTING ///
 
+    /// @dev The budget does not bind on this venue: the maker's position is 1% of the pool's active
+    /// liquidity, so the whole thing unwinds well inside 1bp and the bound is the full position —
+    /// but the *sourceable* full position, net of the fee and the impact the residual swap will
+    /// cost. `MidnightIntegration` proves it is exact to the wei against a real take.
     function test_buyerAssetsBoundReflectsTheParkedPosition() public view {
         uint256 bound = callback.buyerAssetsBound(bytes32(0), market, maker, _callbackData());
 
-        // Naive, so it over-promises slightly against what a real unwind returns — that gap is the
-        // subject of D5/D6. It should still be in the neighbourhood of both sides at spot.
         assertGt(bound, 19_000e6, "bound far below the position");
         assertLt(bound, 20_100e6, "bound above what was parked");
+    }
+
+    /// @dev The bound is a *sourcing* answer, not a valuation. Tighten the budget past what the
+    /// residual swap costs and it falls, on the same position, at the same price, with the same
+    /// paper value — which is the whole reason a maker parked in an LP quotes differently from a
+    /// maker parked in a vault.
+    function test_aTighterBudgetQuotesLess() public {
+        uint256 atOneBp = callback.buyerAssetsBound(bytes32(0), market, maker, _callbackData());
+
+        UniswapV3BuyCallback tight = UniswapV3BuyCallback(
+            factory.createCallback(maker, priceRef, 0.000001e18, POOL_USDC_USDT_100, bytes32(uint256(11)))
+        );
+        vm.prank(maker);
+        INonfungiblePositionManager(V3_POSITION_MANAGER).approve(address(tight), tokenId);
+
+        uint256 atHundredthBp = tight.buyerAssetsBound(bytes32(0), market, maker, _callbackData());
+
+        assertLt(atHundredthBp, atOneBp, "a tighter budget did not reduce the bound");
+        assertGt(atHundredthBp, 0, "a tighter budget collapsed the bound entirely");
     }
 
     function test_buyerAssetsBoundIncludesTheBuffer() public {

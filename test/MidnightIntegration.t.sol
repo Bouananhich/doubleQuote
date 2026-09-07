@@ -198,33 +198,51 @@ contract MidnightIntegrationTest is ParkedPositionBase {
     }
 
     /// @dev What a taker's routing layer reads before deciding what to take, measured against what
-    /// the offer will actually honour. The bound is naive today — position amounts at spot, no
-    /// impact, no swap fee — so it over-promises, and this pins both the direction of the error and
-    /// its size.
+    /// the offer will actually honour. This is the one assertion that says whether `buyerAssetsBound`
+    /// is doing its job, so it is pinned to the wei rather than to a range.
     ///
-    /// @dev At `FORK_BLOCK` the bound reads 19,872.71 USDC against 19,871.46 the position can
-    /// really source: **1.25 USDC, or 0.63bp**. Small, and small is the point — the naive bound is
-    /// already close enough on a stable venue that D5's single-step version has very little to win
-    /// here, and the case for it has to be made on the volatile venue instead. It is also the wrong
-    /// side of correct: a taker who believes the bound gets a reverted transaction, not a bad fill.
-    function test_theBoundOverPromisesAgainstWhatActuallySettles() public {
+    /// @dev **The D5 result.** The naive bound read 19,872.71 USDC against 19,871.46 the position
+    /// could really source — 1.25 USDC of over-promise, 0.63bp, on the wrong side of correct. The
+    /// single-step bound reads **19,871.458852**, and a take of exactly that settles. The residual
+    /// swap here never leaves the active tick range, which is precisely the case D5 claims to model
+    /// exactly, so "close" would have been a failure: the error is zero, not small.
+    ///
+    /// @dev The budget does not bind at this size — the maker's position is 1% of the pool's active
+    /// liquidity, so the whole thing unwinds inside 1bp and the bound is the full position. What
+    /// changed is that it is now the *sourceable* full position rather than the paper one.
+    function test_theBoundIsExactlyWhatSettles() public {
         uint256 bound = callback.buyerAssetsBound(bytes32(0), market, maker, _callbackData());
         assertGt(bound, 19_000e6, "bound does not reflect a ~19.9k position");
 
         _collateralize(bound);
 
-        // The bound itself cannot be filled. Fail closed rather than fill badly.
-        vm.expectRevert(IUniswapV3BuyCallback.InsufficientSourced.selector);
         vm.prank(taker);
         midnight.take(_offer(bound), hex"", bound, taker, taker, address(0), hex"");
 
-        // One basis point under it does fill, which caps the over-promise at 1bp.
-        uint256 achievable = (bound * 9999) / 10_000;
-        vm.prank(taker);
-        midnight.take(_offer(achievable), hex"", achievable, taker, taker, address(0), hex"");
+        assertEq(IERC20Meta(USDC).balanceOf(taker), bound, "taker did not receive the loan");
+        assertEq(midnight.credit(marketId, maker), bound, "maker has no credit");
+    }
 
-        assertEq(IERC20Meta(USDC).balanceOf(taker), achievable, "taker did not receive the loan");
-        assertEq(midnight.credit(marketId, maker), achievable, "maker has no credit");
+    /// @dev The other half of "exact": the bound is not merely honoured, it is *tight*. **One wei**
+    /// above it fails closed — the headroom between the quote and the largest take this position
+    /// can settle is zero, found by bisection at `FORK_BLOCK` and pinned here.
+    ///
+    /// @dev Without this, the test above would pass just as well against a bound that under-promised
+    /// by half the position. That is its own kind of wrong: the maker's capital sits idle because
+    /// the quote said it could not be reached, and a bound nobody trusts to be tight gets discounted
+    /// by the routing layer anyway.
+    function test_theBoundIsTightToTheWei() public {
+        uint256 bound = callback.buyerAssetsBound(bytes32(0), market, maker, _callbackData());
+        uint128 liquidityBefore = _liquidity();
+
+        _collateralize(bound + 1);
+
+        vm.expectRevert(IUniswapV3BuyCallback.InsufficientSourced.selector);
+        vm.prank(taker);
+        midnight.take(_offer(bound + 1), hex"", bound + 1, taker, taker, address(0), hex"");
+
+        assertEq(_liquidity(), liquidityBefore, "a failed take moved the position");
+        assertEq(midnight.debt(marketId, taker), 0, "a failed take created debt");
     }
 
     /// FORK ASSUMPTIONS ///

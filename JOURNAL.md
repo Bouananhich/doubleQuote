@@ -726,3 +726,58 @@ and v3 structurally cannot, and it is worth exactly one adapter.
 The 55,580 gas between them is the price of the maker keeping their NFT. Both numbers belong in
 D11's table, and the table needs three columns, not two — v3, v4-NFT, v4-direct — because
 v3-vs-v4-direct alone conflates the version difference with the custody difference.
+
+## 2026-09-08 — D5: the single-step bound, and what it turned out to be worth
+
+`SourcingMathLib.boundBySlippage` replaces the naive bound on all three adapters. It simulates the
+unwind — burn `dL`, sell the residual on the route venue against a book that `dL` may itself have
+thinned — and bisects on `dL` for the largest fill whose cost stays inside `MAX_SLIPPAGE_WAD`.
+Both `bound.py` findings are implemented rather than approximated.
+
+**The 0.63bp caveat is resolved, and against expectation.** D4 measured the naive bound
+over-promising by 1.25 USDC on the stable venue and flagged that D5 therefore had "very little to
+win here". That was the wrong reading. The new bound reads **19,871.458852 USDC**, and bisecting on
+the real Midnight `take()` puts the largest settleable fill at **19,871.458852** — headroom **zero,
+to the wei**. `MidnightIntegration` now pins both directions: the bound fills, `bound + 1` reverts.
+
+The naive bound was close, but "close" is not the property `buyerAssetsBound` needs. A taker's
+routing layer is asynchronous by construction; a bound that is 0.63bp optimistic hands back a
+reverted transaction, and one that is defensively pessimistic leaves the maker's capital unreachable.
+Exact is a different thing from near, and it is reachable here because the residual swap on a stable
+pair never leaves the active tick range — which is exactly the case the single step models.
+
+**Where it actually bites is v4, and hard.** Same maker, same pair, same fee tier: the parked
+2k+2k is **59.24%** of that pool's active liquidity (788,956,795,188 against 1,331,759,257,984
+post-park). Two things then cut the quote down. `MAX_ACTIVE_SHARE_WAD` refuses to consider burning
+past half the book — finding B, without which the bisection would be searching a function that has
+stopped rising. Inside that cap, the 1bp budget reaches **245.21 USDC**, about 6% of the position's
+~3,950 paper value. The naive bound said 3,950; that number was never reachable by anyone.
+
+So the D4 framing inverts. It is not that the stable venue makes the bound uninteresting — it is
+that *depth relative to the maker* is the whole variable, and v3-USDC/USDT and v4-USDC/USDT happen
+to sit on opposite sides of it while looking identical on paper. That contrast is the demo.
+
+**Park and route are separate here, and `bound.py` could not assume that.** The reference
+implementation models one pool, so burning always thins the book being traded into. In this design
+they are independently chosen, so `sourcedFor` subtracts the burn from the route venue's active
+liquidity *only* when the parked position is in that venue and in range. Same for the active-share
+cap: it binds on the route venue, and an out-of-range position contributes nothing to active
+liquidity, so it is not capped at all. Getting this wrong would have been invisible — the numbers
+stay plausible either way.
+
+**Cost is measured against the route venue's pre-trade spot**, so it is exactly fee plus impact:
+the two things the single step models and can therefore be held to. It deliberately excludes the
+park-venue-versus-route-venue dislocation, which is a price question rather than a swap question and
+belongs to `PRICE_REF` at D8. Note this moves where the budget bites, never what `sourced` is worth
+— `sourced` is the simulated output either way, so the bound stays honest under either reference.
+
+**The bisection predicate is not quite monotone, and that is fine.** A `dL` small enough to round to
+zero output fails the budget check too, so the predicate is false-then-true-then-false rather than
+monotone. `lo` only ever advances on a *true*, so the search either finds the upper boundary or
+returns 0. Under-reporting is the safe direction for a bound; over-reporting is not.
+
+**Still outstanding after D5.** The single step assumes the route venue's active liquidity continues
+in the direction of travel, so it over-estimates against a book that thins out past the current tick
+range. On the stable venue it does not, which is why the answer is exact. D6's tick walk removes the
+assumption; `singleStepOut` returns the post-swap price precisely so that assumption is checkable
+rather than trusted.

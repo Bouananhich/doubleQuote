@@ -108,6 +108,12 @@ abstract contract V4ParkedBase is ForkBase {
         pusher.sell(usdcUsdtRouteKey(), false, amountIn);
     }
 
+    /// @dev The parked pool's active liquidity at the live tick — the book any residual sold here
+    /// has to go through, and the denominator `SourcingMathLib.MAX_ACTIVE_SHARE_WAD` caps against.
+    function _activeLiquidity() internal view returns (uint128) {
+        return IPoolManager(V4_POOL_MANAGER).getLiquidity(poolKey.toId());
+    }
+
     /// @dev Largest liquidity the two amounts can fund over the parked range, the way a position
     /// manager would compute it. In range, so both sides bind and the smaller one wins.
     function _liquidityFor(uint256 amount0, uint256 amount1) internal view returns (uint128) {
