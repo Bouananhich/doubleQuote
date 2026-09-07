@@ -163,6 +163,33 @@ contract SourcingMathLibTest is Test {
         assertLe(sized, LIQUIDITY, "cannot burn more than exists");
     }
 
+    /// ESCALATION CEILING ///
+
+    /// @dev The property the ceiling exists for. A fill sized to almost nothing must not be able to
+    /// reach the whole position, however far short its burn falls.
+    function test_theCeilingKeepsADustBurnProportional() public pure {
+        assertEq(SourcingMathLib.escalationCeiling(1, LIQUIDITY), 2, "a one-unit burn could escalate past two");
+    }
+
+    function test_theCeilingIsTwiceTheSizedBurn() public pure {
+        assertEq(SourcingMathLib.escalationCeiling(1e17, LIQUIDITY), 2e17);
+    }
+
+    /// @dev It is a ceiling, not a target: it can never exceed what the position holds.
+    function test_theCeilingClampsToTheAvailableLiquidity() public pure {
+        assertEq(SourcingMathLib.escalationCeiling(uint128(LIQUIDITY), LIQUIDITY), LIQUIDITY, "clamp at exactly full");
+        assertEq(SourcingMathLib.escalationCeiling(uint128(LIQUIDITY / 2 + 1), LIQUIDITY), LIQUIDITY, "clamp past full");
+    }
+
+    function test_theCeilingIsZeroForAZeroBurn() public pure {
+        assertEq(SourcingMathLib.escalationCeiling(0, LIQUIDITY), 0, "nothing sized, nothing to escalate to");
+    }
+
+    /// @dev No `uint128` can overflow the ceiling, because it is computed in `uint256`.
+    function testFuzz_theCeilingNeverExceedsTheAvailableLiquidity(uint128 sized, uint128 available) public pure {
+        assertLe(SourcingMathLib.escalationCeiling(sized, available), available);
+    }
+
     /// INVARIANTS ///
 
     function testFuzz_sizingNeverExceedsTheAvailableLiquidity(uint256 target, bool targetIsToken0) public pure {

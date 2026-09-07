@@ -26,6 +26,10 @@ abstract contract ForkBase is Test {
     address internal constant V4_POOL_MANAGER = 0x498581fF718922c3f8e6A244956aF099B2652b2b;
     address internal constant V4_POSITION_MANAGER = 0x7C5f5A4bBd8fD63184577525326123B519429bDc;
 
+    /// @dev Canonical Permit2, the same address on every chain. v4's `PositionManager` pulls
+    /// payment through it, so a fixture that mints a v4 position needs a two-step approval.
+    address internal constant PERMIT2 = 0x000000000022D473030F116dDEE9F6B43aC78BA3;
+
     // --- Tokens ---
 
     address internal constant USDC = 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913;
@@ -44,6 +48,23 @@ abstract contract ForkBase is Test {
     /// @dev The same pair, ~50x thinner. Not a venue anything parks in — it is the *route* venue a
     /// test can move without touching the price the burn sizing reads off the parked pool.
     address internal constant POOL_USDC_USDT_500 = 0xB7F084c7f7f1c680d08780e2b2ef4F2133DB0Df8;
+
+    /// @dev The v4 counterpart of the product venue: USDC/USDT, 0.01%, tick spacing 1, no hooks.
+    /// Identified by its `PoolKey` rather than an address, since v4 pools are not contracts.
+    /// Initialised and at tick 7 at `FORK_BLOCK`, the same tick as the v3 pool.
+    ///
+    /// @dev **Far thinner than v3.** 5.43e11 of active liquidity against the v3 pool's 3.93e14 —
+    /// a factor of ~724 at this block. Nothing to do with the adapter, but it caps how large a
+    /// fill the v4 tests can use before the residual swap's impact swamps the sizing margin, and
+    /// it is a real finding about where the liquidity actually is.
+    uint24 internal constant V4_USDC_USDT_FEE = 100;
+    int24 internal constant V4_USDC_USDT_TICK_SPACING = 1;
+
+    /// @dev The same pair on v4 at 0.05% / spacing 10, initialised and at tick 11. Not a venue
+    /// anything parks in — it is the *route* venue a test can move without touching the price the
+    /// burn sizing reads off the parked pool. The v4 counterpart of `POOL_USDC_USDT_500`.
+    uint24 internal constant V4_USDC_USDT_ROUTE_FEE = 500;
+    int24 internal constant V4_USDC_USDT_ROUTE_TICK_SPACING = 10;
 
     function setUp() public virtual {
         vm.createSelectFork(_baseRpcUrl(), FORK_BLOCK);

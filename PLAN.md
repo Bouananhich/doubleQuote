@@ -68,7 +68,34 @@ Midnight on Base**, sourced out of a real v3 position. **87/87.**
   balance under a flash loan). The v3 analogue of the first is already in
   `UniswapV3BuyCallback.t.sol`; the second has no counterpart.
 
-**Next:** D4 (v4 adapter) as scheduled.
+## D4 — done, and larger than planned
+
+**Both v4 custody modes shipped.** `UniswapV4BuyCallback` (custodial, direct on `PoolManager`),
+`UniswapV4NftBuyCallback` (non-custodial, `PositionManager` NFT), a shared
+`UniswapV4BuyCallbackBase`, and a factory each. **121/121.**
+
+v4 forces a choice v3 did not: `modifyLiquidity` keys positions by `msg.sender`, and `unlock`
+reverts `AlreadyUnlocked` when nested, so one-unlock netting and non-custodial parking are mutually
+exclusive. Building only one would have made the gas table compare custody models and call the
+difference "v4". Full reasoning in `JOURNAL.md`.
+
+- **The netting difference is measured, not asserted.** Residual ERC-20 transfers touching the
+  callback during one settlement: **0** custodial, **2** through the NFT path. Gas on the same 500
+  USDC fill: **296,485** vs **352,065**.
+- **v4 USDC/USDT is 724x thinner than v3** at this block — 5.43e11 against 3.93e14, same pair, same
+  fee tier, same tick. The v4 fixtures park 2k+2k and fill in the hundreds because that is what the
+  venue absorbs. D11's table has to say so or it compares trades rather than plumbing.
+- Native currency is refused at deployment and at parking on both adapters. It costs the ETH pools,
+  which are v4's deepest. A stated limitation, not an oversight.
+- The `PositionManager` interface is hand-written (v4-periphery would drag in a second compiler
+  profile) and asserted against the deployment rather than trusted.
+
+**Cost:** this ran past the one day D4 had, as flagged before starting. It comes out of slack; if it
+reaches D5, the tick walk is what gives, per risk #2.
+
+**Next:** D5 — but see the D5/D6 caveat under the integration suite above. The naive bound is
+already within 0.63bp on the stable venue, so the single-step version has to justify itself on the
+volatile venue.
 
 **Open, needs a decision:** the repo has no root `LICENSE` file. The forked Morpho periphery is
 GPL-2.0-or-later, so the derivative is too; the file headers already say so but the repo does not.

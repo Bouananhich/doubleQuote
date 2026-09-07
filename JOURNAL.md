@@ -640,3 +640,89 @@ the **volatile venue**, where the residual swap crosses ticks and range exit is 
 frontier chart on D11 should show the two venues side by side or it will look like solving a
 problem that was already solved. If the volatile-venue gap also turns out to be small, that is a
 finding worth reporting rather than a reason to build the tick walk anyway.
+
+## 2026-09-07 (D4) — v4 forces a custody choice that v3 did not, so both adapters get built
+
+Two facts about v4-core decide the shape of this day, and both were verified in the source rather
+than assumed:
+
+- **`PoolManager.modifyLiquidity` keys a position by `owner: msg.sender`** (`PoolManager.sol:161`).
+  The only position a contract can burn is one it owns.
+- **`unlock` reverts `AlreadyUnlocked` when nested** (`PoolManager.sol:105`). A decrease routed
+  through `PositionManager` opens its own unlock, so it cannot share one with our residual swap.
+
+Together those mean the v4 adapter cannot have both of the things v3 gave us for free. Either the
+maker keeps an NFT and the settlement takes two unlocks and four token movements — which is what v3
+already does, in different syntax — or the callback owns the liquidity directly and the whole
+unwind nets inside one unlock, which is the only reason `JOURNAL.md` said v4 earns a second adapter
+at all.
+
+**Decision: build both.** The custodial one (`UniswapV4BuyCallback`) is the thesis artifact; the
+non-custodial one is the honest comparison. Shipping only the fast path would leave the gas table
+comparing a custodial design against a non-custodial one and calling the difference "v4", which is
+not what the difference is. Shipping only the NFT path would spend a day proving v4 is not cheaper,
+having declined to build the configuration where it is.
+
+The cost is real and is not hidden: this is more than the one day D4 has. It comes out of slack,
+and if it eats into D5 the tick walk is the thing that gives, per the ranked risks.
+
+**How the custodial one is constrained.** D1 ruled out an owner-withdraw path on the base because
+non-custodial parking made it unnecessary. That reasoning does not reach here, so `unpark` exists —
+owner-only, and it takes **no recipient**: the funds' only destinations are back to `OWNER` or into
+settling `OWNER`'s own offers. `park` likewise pulls only from `OWNER`. That is weaker than "the
+maker never gives up the NFT" and it is the most this design can offer, so it is stated as a
+property and tested as one rather than described in a comment.
+
+Native currency is refused outright, at deployment and at parking. Settling ETH needs a payable
+path and a `receive` hook, and each new way for value to enter the contract is more surface for the
+envelope to cover. It costs the ETH/USDC pools, which are the deepest on v4, and that is a real
+limitation rather than an oversight.
+
+## 2026-09-07 (D4) — Where the liquidity actually is: v4 USDC/USDT is 724x thinner than v3
+
+At `FORK_BLOCK` the v4 USDC/USDT 0.01% pool holds **5.43e11** of active liquidity. Its v3
+counterpart holds **3.93e14**. Same pair, same fee tier, same chain, same block, and both at tick 7.
+
+This is not a footnote for a project whose thesis is "park where the yield already is". Parking the
+v3 fixture's 10k+10k in the v4 pool would make the maker's position seven times the entire pool's
+active liquidity, and every residual swap would move the price by more than the sizing margin
+covers. The v4 suite parks 2k+2k and fills in the hundreds — sized to the venue, not to v3.
+
+Two consequences worth carrying forward:
+
+- **The gas table has to be labelled honestly.** v3 and v4 are the same operation over different
+  plumbing, not the same trade. Comparing a 5,000 fill on v3 against a 500 fill on v4 and reporting
+  the gas difference without that caveat would be misleading, and D11 has to say so.
+- **It is feedback.** A developer choosing where to build against Uniswap on Base today would find
+  the stable-pair liquidity still overwhelmingly in v3. That belongs in `FEEDBACK.md`, stated as a
+  measurement rather than a complaint.
+
+## 2026-09-07 (D4) — Two v4 adapters, and the seam between them
+
+`UniswapV4BuyCallbackBase` holds what both share: the route venue immutables, the residual swap,
+delta accounting, the escalation ceiling, the burn sizing and the naive bound. What differs is only
+*where the liquidity lives and how it is burnt* — which is the smallest possible difference for two
+adapters that exist to be compared.
+
+Extracted at the second use rather than up front. Writing the custodial one first and pulling the
+base out when the NFT one arrived meant the seam was drawn around code that existed, not code that
+was imagined. Risk #1 in `PLAN.md` says that if two adapters share less than about two-thirds of
+their logic the abstraction is wrong; these share more than that, and the check is that
+`UniswapV4NftBuyCallback` is 10.5KB against the base's contribution to both.
+
+**The netting difference is now a measurement rather than a claim.** Counting ERC-20 `Transfer`
+events on the residual token that touch the callback during one settlement:
+
+| | residual transfers | gas, 500 USDC fill |
+|---|---|---|
+| `UniswapV4BuyCallback` (custodial) | **0** | 296,485 |
+| `UniswapV4NftBuyCallback` (NFT) | **2** | 352,065 |
+
+Zero is the interesting number. The custodial adapter does not "end up holding none of the
+residual" — it never touches it. The burn credits a delta, the swap consumes the same delta, and no
+transfer of the residual token happens at any point in the settlement. That is the thing v4 can do
+and v3 structurally cannot, and it is worth exactly one adapter.
+
+The 55,580 gas between them is the price of the maker keeping their NFT. Both numbers belong in
+D11's table, and the table needs three columns, not two — v3, v4-NFT, v4-direct — because
+v3-vs-v4-direct alone conflates the version difference with the custody difference.

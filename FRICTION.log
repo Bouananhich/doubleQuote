@@ -94,3 +94,21 @@ part that makes the feedback actionable and the part that is impossible to recon
     Worth saying plainly because it cuts both ways for this project: the same cliff is why the
     escalation ceiling has to be a bounded multiple rather than a retry loop.
     (cost: ~40m, most of it reading a trace to find out the pool had been emptied)
+
+2026-09-07 --:--  [v4-periphery]  minting a v4 position fails with an opaque selector from a third contract.
+    Approved USDC and USDT to the PositionManager, encoded MINT_POSITION + SETTLE_PAIR, called
+    modifyLiquidities. Reverted with `custom error 0xd81b2f2e:` and nothing else -- no name, no
+    args, and the selector belongs to neither the position manager nor the pool manager. Only a
+    -vvvv trace shows the last frame is 0x000000000022D473030F116dDEE9F6B43aC78BA3, i.e. Permit2,
+    and 0xd81b2f2e is AllowanceExpired(uint256).
+    The actual requirement is that v4's PositionManager pays via Permit2, so the approval is two
+    steps -- ERC20.approve(PERMIT2) then PERMIT2.approve(token, positionManager, amount, expiry) --
+    and an expiration of 0 from a never-used Permit2 allowance reads as *expired* rather than as
+    *absent*. A plain ERC20 approval to the position manager, which is what v3 needs and therefore
+    what anyone arriving from v3 will write, silently does nothing.
+    Two separate costs. Naming the error would have saved most of it: `AllowanceExpired` in a v4
+    mint trace points straight at Permit2. And a docs line at the top of the v4 minting guide
+    saying "payment goes through Permit2, here are the two approvals" would have saved all of it.
+    Notable that the whole action encoding was correct first time -- the failure was entirely in
+    the payment path, which is the part that differs from v3 without saying so.
+    (cost: ~25m)
