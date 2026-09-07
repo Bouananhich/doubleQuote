@@ -590,3 +590,53 @@ layer would keep offering fills the offer will refuse.
 
 Not ruled out as a maker policy, but it is a product decision with a fillability cost, and it is no
 longer load-bearing for safety.
+
+## 2026-09-07 — The integration suite binds deployed Midnight instead of deploying its own
+
+`BlueBuyCallbackIntegrationTest`, the suite deferred from D1, is now forked as
+`test/MidnightIntegration.t.sol`. Forked in spirit, not in mechanism, and the difference is a
+deliberate choice rather than an accident of the harness.
+
+Upstream deploys a fresh Midnight and a fresh Blue with `deployCode`, then configures both into
+whatever shape the test wants — enabling an LLTV, setting the market's tick spacing to 1. That is
+the right call for testing Midnight. It is the wrong call for testing an *integration* with
+Midnight, because every configuration step the test performs is a step the real deployment might
+not permit, and the test would never find out.
+
+Binding the deployed instance found exactly that, immediately:
+
+- **`tickSpacingSetter` is `address(0)`.** Nobody can call `setMarketTickSpacing` — the upstream
+  setup line has no counterpart here. Markets keep `DEFAULT_TICK_SPACING` (4), so an offer's tick
+  must be a multiple of 4 or it is unreachable. `MAX_TICK` is 6744, which divides by 4, so this
+  cost nothing this time; it would have cost a confusing revert on any tick chosen carelessly.
+- **Only some parameters are enabled.** Liquidation cursor `0.3e18` is; `0.5e18` and `1e18` are
+  not. The market has to be assembled from what the configurator has actually turned on.
+- **USDC carries no settlement or continuous fee**, so `buyerAssets == sellerAssets`. Worth an
+  assertion rather than an assumption: if that changes, the arithmetic in every take assertion
+  changes with it, and it is better to fail on the fee than on the sum.
+
+The general form: a test that configures its dependency into the shape it wants is testing the
+shape, not the dependency. Everything the fork will not let us configure is a constraint the
+deployed offer would have hit anyway.
+
+What this suite adds over pranking `MIDNIGHT` directly is the second half of settlement. `take()`
+pulls `buyerAssets` out of the callback by `transferFrom` *after* `onBuy` returns — an approval
+short by one wei passes every earlier test and fails only here.
+
+## 2026-09-07 — The naive bound is already within a basis point on the stable venue
+
+Measured through a real take: `buyerAssetsBound` reads **19,872.71** USDC against **19,871.46** the
+position can actually source. The over-promise is 1.25 USDC, **0.63bp**, and it is on the right
+side of correct — a taker who believes the bound gets a revert, not a bad fill.
+
+That is a smaller error than the work scheduled to fix it assumes. D5's single-step bound and D6's
+tick walk were both justified by the naive version being a knowingly bad over-estimate. On the
+product venue it is not: a stable pair whose residual never leaves the active tick range simply
+does not generate much of a gap, which is the same property that made the 25bp impact margin a
+hundredfold cushion on D3.
+
+This does not cancel D5 or D6, but it relocates the argument for them. The case has to be made on
+the **volatile venue**, where the residual swap crosses ticks and range exit is live, and the
+frontier chart on D11 should show the two venues side by side or it will look like solving a
+problem that was already solved. If the volatile-venue gap also turns out to be small, that is a
+finding worth reporting rather than a reason to build the tick walk anyway.
