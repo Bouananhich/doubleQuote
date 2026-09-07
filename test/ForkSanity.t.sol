@@ -66,6 +66,9 @@ contract ForkSanityTest is ForkBase {
         assertEq(IUniswapV3Factory(V3_FACTORY).getPool(USDC, USDT, 100), POOL_USDC_USDT_100, "USDC/USDT");
         assertGt(IUniswapV3Pool(POOL_USDC_USDT_100).liquidity(), 0, "USDC/USDT empty");
 
+        assertEq(IUniswapV3Factory(V3_FACTORY).getPool(USDC, USDT, 500), POOL_USDC_USDT_500, "USDC/USDT 0.05%");
+        assertGt(IUniswapV3Pool(POOL_USDC_USDT_500).liquidity(), 0, "USDC/USDT 0.05% empty");
+
         // The stable pool is the deeper of the two, which is why it is the product venue.
         assertGt(
             IUniswapV3Pool(POOL_USDC_USDT_100).liquidity(),

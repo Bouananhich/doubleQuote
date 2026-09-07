@@ -66,3 +66,31 @@ part that makes the feedback actionable and the part that is impossible to recon
     miscount compiles fine and reads the wrong field. Wrapped it in a local struct immediately.
     Not a blocker, but it is the kind of thing that makes an integration bug silent.
     (cost: ~5m)
+
+2026-09-05 --:--  [v3-periphery]  burning liquidity takes two calls and cannot pay out directly.
+    Expected decreaseLiquidity to return the tokens. It does not -- it credits tokensOwed on the
+    position, and a second collect() call moves them, so every unwind is two calls to the position
+    manager even when you want the whole thing in one place. v4 does the equivalent inside a single
+    unlock() with one netted delta, which is exactly the comparison this project exists to measure,
+    so this is a data point rather than a complaint. Noting it because the two-step is also what
+    makes a *partial* unwind awkward: you size the burn, then collect sweeps everything owed
+    including accrued fees, so the amount that arrives is not the amount you sized for.
+    (cost: ~15m reasoning about what collect actually returns)
+
+2026-09-07 --:--  [v3-core / testing]  a concentrated pool has no "slightly dislocated" state.
+    Wanted a fork test where the route venue is priced a little away from the park venue, to drive
+    a sourcing estimate a few tens of bp short. There is no such state to reach on Base's stable
+    pools. USDC/USDT 0.01% holds 94k USDC against L = 3.9e14, so its entire token0 side lives
+    inside ~5 ticks; the 0.05% pool holds 4.9k against L = 7.6e12, ~13 ticks. Pushing to a named
+    price -- the obvious way to write it, sqrtPriceLimitX96 at +1% -- walks straight through the
+    band and leaves the pool with literally nothing on the far side, so the residual sold for
+    5.87 USDC instead of 2,507. Price impact against a concentrated pool is not a curve you can
+    aim at, it is a cliff: ~0bp, then ~100%.
+    The fix was to stop naming a price and name an amount instead, then sweep amounts until the
+    window appeared. It is wide once found (2.5k-4.5k of USDT all land in it) but nothing in the
+    pool's public surface tells you where it is -- liquidity() is the active-tick L, which says
+    nothing about how far that L extends, and there is no view for "how much token0 is left before
+    the book thins". Tick bitmap walking is the only answer and that is D6 work.
+    Worth saying plainly because it cuts both ways for this project: the same cliff is why the
+    escalation ceiling has to be a bounded multiple rather than a retry loop.
+    (cost: ~40m, most of it reading a trace to find out the pool had been emptied)

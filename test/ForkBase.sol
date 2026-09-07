@@ -41,6 +41,10 @@ abstract contract ForkBase is Test {
     /// @dev The product venue. ~50x the liquidity of the 0.05% USDC/USDT pool at FORK_BLOCK.
     address internal constant POOL_USDC_USDT_100 = 0xD56da2B74bA826f19015E6B7Dd9Dae1903E85DA1;
 
+    /// @dev The same pair, ~50x thinner. Not a venue anything parks in — it is the *route* venue a
+    /// test can move without touching the price the burn sizing reads off the parked pool.
+    address internal constant POOL_USDC_USDT_500 = 0xB7F084c7f7f1c680d08780e2b2ef4F2133DB0Df8;
+
     function setUp() public virtual {
         vm.createSelectFork(_baseRpcUrl(), FORK_BLOCK);
     }
