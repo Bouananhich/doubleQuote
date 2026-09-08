@@ -206,6 +206,248 @@ contract SourcingMathLibTest is Test {
         assertLe(_liquidityFor(smaller, true), _liquidityFor(larger, true), "sizing must not decrease with the target");
     }
 
+    /// SINGLE-STEP BOUND ///
+
+    /// @dev A deep venue: the position is a thousandth of the book, so its residual barely moves it.
+    function _params(uint128 routeLiquidity, bool routeIsParkVenue, uint256 budgetWad)
+        internal
+        pure
+        returns (SourcingMathLib.BoundParams memory)
+    {
+        return SourcingMathLib.BoundParams({
+            sqrtPriceX96: SQRT_PRICE_1,
+            sqrtLowerX96: _lower(),
+            sqrtUpperX96: _upper(),
+            liquidity: LIQUIDITY,
+            loanIsToken0: true,
+            routeSqrtPriceX96: SQRT_PRICE_1,
+            routeLiquidity: routeLiquidity,
+            routeFeePips: FEE_100,
+            residualIsRouteToken0: false,
+            routeIsParkVenue: routeIsParkVenue,
+            maxSlippageWad: budgetWad
+        });
+    }
+
+    /// @dev The step is the exact-input formula and nothing else: no fee, no impact, no venue, just
+    /// `L` and a price. At parity with a residual a millionth of the book, output is input to well
+    /// under a basis point.
+    function test_theSingleStepIsNearlyLosslessAgainstADeepBook() public pure {
+        (uint256 out,) = SourcingMathLib.singleStepOut(SQRT_PRICE_1, 1e24, 0, false, 1e18, 0);
+
+        assertApproxEqRel(out, 1e18, 0.00001e18, "a millionth of the book should barely move it");
+        assertLt(out, 1e18, "a swap returned more than it was given");
+    }
+
+    function test_theSingleStepChargesTheVenueFee() public pure {
+        (uint256 free,) = SourcingMathLib.singleStepOut(SQRT_PRICE_1, 1e24, 0, false, 1e18, 0);
+        (uint256 paid,) = SourcingMathLib.singleStepOut(SQRT_PRICE_1, 1e24, FEE_100, false, 1e18, 0);
+
+        assertLt(paid, free, "the fee was not charged");
+        assertApproxEqRel(free - paid, 1e14, 0.001e18, "1bp of 1e18 is 1e14");
+    }
+
+    /// @dev **Finding A.** Burning does not move the price, it removes liquidity from the book the
+    /// residual is about to be sold into. Same swap, thinner book, worse fill.
+    function test_burningTheBookMakesTheSameSwapWorse() public pure {
+        (uint256 whole,) = SourcingMathLib.singleStepOut(SQRT_PRICE_1, 1e24, FEE_100, false, 1e18, 0);
+        (uint256 thinned,) = SourcingMathLib.singleStepOut(SQRT_PRICE_1, 1e24, FEE_100, false, 1e18, 5e23);
+
+        assertLt(thinned, whole, "thinning the book did not cost anything");
+    }
+
+    function test_theSingleStepIsZeroWhenTheBurnTookTheWholeBook() public pure {
+        (uint256 out, uint160 after_) = SourcingMathLib.singleStepOut(SQRT_PRICE_1, 1e24, FEE_100, false, 1e18, 1e24);
+
+        assertEq(out, 0, "sold into an empty book");
+        assertEq(after_, SQRT_PRICE_1, "an impossible swap moved the price");
+    }
+
+    /// @dev Selling token1 raises the price, selling token0 lowers it. The direction is not
+    /// cosmetic: it decides which `getAmountXDelta` prices the output, and getting it backwards
+    /// would leave the bound plausible and wrong.
+    function test_theSingleStepMovesThePriceInTheDirectionOfTheTrade() public pure {
+        (, uint160 up) = SourcingMathLib.singleStepOut(SQRT_PRICE_1, 1e24, FEE_100, false, 1e18, 0);
+        (, uint160 down) = SourcingMathLib.singleStepOut(SQRT_PRICE_1, 1e24, FEE_100, true, 1e18, 0);
+
+        assertGt(up, SQRT_PRICE_1, "selling token1 did not raise the price");
+        assertLt(down, SQRT_PRICE_1, "selling token0 did not lower the price");
+    }
+
+    /// @dev The cost the budget is measured against is exactly what the residual lost on the way
+    /// through the route venue — fee plus impact — never the loan-token side, which is not swapped.
+    function test_sourcingCostsOnlyWhatTheResidualLoses() public pure {
+        SourcingMathLib.BoundParams memory p = _params(1e24, false, 1e18);
+
+        (uint256 sourced, uint256 cost) = SourcingMathLib.sourcedFor(p, LIQUIDITY);
+
+        assertGt(sourced, 0, "nothing sourced");
+        assertGt(cost, 0, "a real swap cost nothing");
+        assertLt(cost, sourced / 100, "the whole position cannot cost 1% on a book this deep");
+    }
+
+    function test_sourcingIsZeroForAZeroBurn() public pure {
+        (uint256 sourced, uint256 cost) = SourcingMathLib.sourcedFor(_params(1e24, false, 1e18), 0);
+
+        assertEq(sourced, 0);
+        assertEq(cost, 0);
+    }
+
+    /// @dev **Finding B.** The cap is on the *route* venue's active liquidity, and it binds only
+    /// when the burn actually thins that venue.
+    function test_theActiveShareCapBindsOnlyWhenTheBurnThinsTheRoute() public pure {
+        // Position is the whole book. Same pool: half of it is the most that may be burnt.
+        assertEq(
+            SourcingMathLib.maxBurnableLiquidity(_params(LIQUIDITY, true, 1e18)),
+            LIQUIDITY / 2,
+            "the active-share cap did not bind"
+        );
+
+        // Different pool: burning here thins nothing there, so the whole position is available.
+        assertEq(
+            SourcingMathLib.maxBurnableLiquidity(_params(LIQUIDITY, false, 1e18)),
+            LIQUIDITY,
+            "the cap bound on a venue the burn does not touch"
+        );
+    }
+
+    /// @dev An out-of-range position contributes nothing to active liquidity, so burning it thins
+    /// nothing even when park and route are the same pool.
+    function test_theCapIgnoresAnOutOfRangePosition() public pure {
+        SourcingMathLib.BoundParams memory p = _params(LIQUIDITY, true, 1e18);
+        p.sqrtPriceX96 = _upper() + 1;
+        p.routeSqrtPriceX96 = _upper() + 1;
+
+        assertEq(SourcingMathLib.maxBurnableLiquidity(p), LIQUIDITY, "an idle position was treated as active");
+    }
+
+    /// @dev A budget wide enough to cover any real swap returns the whole position — the fast path,
+    /// and the ordinary answer on a deep venue.
+    function test_aGenerousBudgetQuotesTheWholePosition() public pure {
+        SourcingMathLib.BoundParams memory p = _params(1e24, false, 1e18);
+
+        (uint256 whole,) = SourcingMathLib.sourcedFor(p, LIQUIDITY);
+
+        assertEq(SourcingMathLib.boundBySlippage(p), whole, "a 100% budget did not quote the whole position");
+    }
+
+    /// @dev The point of the whole exercise: tighten the budget and the quote falls, on the same
+    /// position, at the same price, with the same paper value.
+    /// @dev The route venue here is ten times the position rather than a thousand, because on a
+    /// book deep enough neither budget binds and the test would pass for the wrong reason.
+    function test_aTighterBudgetQuotesLess() public pure {
+        uint256 wide = SourcingMathLib.boundBySlippage(_params(1e19, false, 0.001e18));
+        uint256 tight = SourcingMathLib.boundBySlippage(_params(1e19, false, 0.0001e18));
+
+        assertGt(tight, 0, "the tight budget quoted nothing at all");
+        assertGt(wide, tight, "tightening the budget did not reduce the quote");
+    }
+
+    /// @dev A budget no swap can meet has to quote zero rather than a small-but-wrong number. The
+    /// bisection's floor is where a bound that under-promises is still correct and one that rounds
+    /// up is not.
+    function test_anImpossibleBudgetQuotesNothing() public pure {
+        assertEq(SourcingMathLib.boundBySlippage(_params(1e21, false, 0)), 0, "a zero budget quoted something");
+    }
+
+    /// @dev A route venue with no liquidity sells the residual for nothing, so the residual is a
+    /// total loss and only the loan-token side of the burn survives. Under any realistic budget
+    /// that whole-residual loss blows through the ratio at every `dL`, and the quote is zero.
+    ///
+    /// @dev It is *not* zero under a 100% budget, and that is consistent rather than a gap: a maker
+    /// who authorises losing everything on the swap really can still source the direct side. The
+    /// deployable ceiling on `MAX_SLIPPAGE_WAD` is 10%, so no deployment can ask for that.
+    function test_anEmptyRouteVenueQuotesNothingUnderARealBudget() public pure {
+        assertEq(SourcingMathLib.boundBySlippage(_params(0, true, 0.0001e18)), 0, "quoted against an empty route venue");
+
+        (uint256 direct,) = SourcingMathLib.sourcedFor(_params(0, true, 1e18), LIQUIDITY);
+        assertEq(
+            SourcingMathLib.boundBySlippage(_params(0, true, 1e18)),
+            direct,
+            "a 100% budget should still reach the loan-token side"
+        );
+    }
+
+    /// @dev **The dust floor.** A `dL` too small for the residual to survive rounding used to price
+    /// as *free* — zero residual, therefore zero cost, therefore inside any budget. That is what let
+    /// a bisection return a bound of 1 wei on a config whose honest answer was zero at every size.
+    /// Below the model's resolution is not quotable.
+    function test_aBurnTooSmallToPriceIsNotQuotable() public pure {
+        (uint256 sourced, uint256 cost) = SourcingMathLib.sourcedFor(_params(1e24, false, 1e18), 1);
+
+        assertEq(sourced, 0, "a dust burn was quoted");
+        assertEq(cost, 0);
+    }
+
+    /// @dev The same rounding, but out of range, is not rounding at all: the position really is all
+    /// loan token, there is nothing to sell, and sourcing it really is free. The two cases have to
+    /// be told apart or the floor above would refuse a legitimate one-sided position.
+    function test_aOneSidedPositionOutOfRangeIsStillQuotable() public pure {
+        SourcingMathLib.BoundParams memory p = _params(1e24, false, 1e18);
+        p.sqrtPriceX96 = _upper() + 1; // above the range: all token1, and token1 is the residual
+
+        p.loanIsToken0 = false; // so the loan side is the one the position holds
+        (uint256 sourced, uint256 cost) = SourcingMathLib.sourcedFor(p, LIQUIDITY);
+
+        assertGt(sourced, 0, "an out-of-range position quoted nothing");
+        assertEq(cost, 0, "a position with no residual to sell was charged for selling it");
+    }
+
+    /// @dev **The fee floor.** The venue charges its fee whatever the arithmetic rounds to, so the
+    /// modelled cost may never come in under it. The fee is the *proportional* term — it costs the
+    /// same fraction at every size — so letting it round away is what turns "no honest bound at any
+    /// size" into a spurious dust quote.
+    function test_theModelledCostIsNeverBelowTheVenueFee() public pure {
+        SourcingMathLib.BoundParams memory p = _params(type(uint128).max, false, 1e18);
+
+        (, uint256 cost) = SourcingMathLib.sourcedFor(p, LIQUIDITY);
+
+        // A book this deep has no measurable impact, so the fee is all that is left — and it is
+        // still charged rather than rounded to nothing.
+        assertGt(cost, 0, "an effectively lossless swap was modelled as free");
+    }
+
+    /// @dev A route fee that exceeds the budget on its own admits no fill at any size, and the only
+    /// honest answer is zero. This is the shape of the bug the D5 review found: 5bp of route fee
+    /// against a 1bp budget quoted 1 wei, which then failed to settle.
+    function test_aFeeAboveTheBudgetQuotesNothingRatherThanDust() public pure {
+        SourcingMathLib.BoundParams memory p = _params(type(uint128).max, false, 0.0001e18);
+        p.routeFeePips = 500; // 5bp against a 1bp budget
+
+        assertEq(SourcingMathLib.boundBySlippage(p), 0, "quoted a size the route fee alone rules out");
+    }
+
+    /// @dev Mirrors `bound.py`'s monotonicity check, which is what makes the bisection legitimate:
+    /// inside the cap, burning more sources more and costs proportionally more. If this ever fails,
+    /// `boundBySlippage` is searching a function it has no right to bisect.
+    function test_sourcingRisesWithTheBurnAndSoDoesItsCostRatio() public pure {
+        SourcingMathLib.BoundParams memory p = _params(2 * uint128(LIQUIDITY), true, 1e18);
+        uint128 cap = SourcingMathLib.maxBurnableLiquidity(p);
+
+        uint256 previousSourced = 0;
+        uint256 previousRatio = 0;
+
+        for (uint256 i = 1; i <= 20; ++i) {
+            (uint256 sourced, uint256 cost) = SourcingMathLib.sourcedFor(p, uint128((uint256(cap) * i) / 20));
+            uint256 ratio = (cost * 1e18) / sourced;
+
+            assertGt(sourced, previousSourced, "sourcing did not rise with the burn");
+            assertGe(ratio, previousRatio, "the cost ratio fell as the burn grew");
+
+            previousSourced = sourced;
+            previousRatio = ratio;
+        }
+    }
+
+    function testFuzz_theBoundNeverExceedsTheWholePosition(uint256 budgetWad) public pure {
+        budgetWad = bound(budgetWad, 0, 1e18);
+
+        SourcingMathLib.BoundParams memory p = _params(1e24, false, budgetWad);
+        (uint256 whole,) = SourcingMathLib.sourcedFor(p, LIQUIDITY);
+
+        assertLe(SourcingMathLib.boundBySlippage(p), whole, "quoted more than the position can source");
+    }
+
     /// QUOTES ///
 
     function test_quotesAreInverseAtParity() public pure {

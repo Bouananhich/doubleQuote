@@ -112,3 +112,12 @@ part that makes the feedback actionable and the part that is impossible to recon
     Notable that the whole action encoding was correct first time -- the failure was entirely in
     the payment path, which is the part that differs from v3 without saying so.
     (cost: ~25m)
+
+2026-09-08 10:40  [v4-core]  Expected `Currency` to support `!=` because it supports `==` ->
+    `Currency` is a user-defined value type with an `==` operator attached but no `!=`, so
+    `residualCurrency != ROUTE_CURRENCY0` fails to compile with "Built-in binary operator !=
+    cannot be applied to types Currency and Currency". Have to write `!(a == b)`. Solidity has
+    supported `using {f as !=}` since 0.8.19, so this is a one-line omission in `Currency.sol`
+    rather than a language limit. Trivial to work around, but it is the kind of thing that reads
+    as "I have the wrong import" for a minute before it reads as "the operator is missing".
+    (cost: ~3m)

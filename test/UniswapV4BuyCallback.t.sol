@@ -211,11 +211,27 @@ contract UniswapV4BuyCallbackTest is V4ParkedBase {
 
     /// QUOTING ///
 
-    function test_buyerAssetsBoundReflectsTheParkedPosition() public view {
+    /// @dev **Where v4's thinness turns into a smaller quote.** Same maker, same pair, same fee
+    /// tier: on v3 the bound is the whole position, because that position is 1% of the book. Here
+    /// the parked 2k+2k is **59% of the pool's active liquidity**, and two separate things cut the
+    /// quote down. `SourcingMathLib.MAX_ACTIVE_SHARE_WAD` refuses to consider burning past half the
+    /// book at all — finding B, without which the bisection would be searching a function that no
+    /// longer rises. Inside that cap, the 1bp budget reaches about **245 USDC**, roughly 6% of the
+    /// position's paper value.
+    ///
+    /// @dev That is the bound working, not failing. A maker who *is* most of the venue cannot sell
+    /// most of the venue into itself at spot, and a quote that said otherwise would hand the taker
+    /// either a reverted transaction or a fill priced by the maker's own unwind. The naive bound
+    /// said ~3,950 here; that number was never reachable.
+    function test_theBoundIsCutDownByHowMuchOfTheVenueTheMakerIs() public view {
+        uint128 active = _activeLiquidity();
+        uint128 parked = _liquidityFor(PARKED_USDC, PARKED_USDT);
+        assertGt(uint256(parked) * 2, active, "the maker is no longer past the active-share cap");
+
         uint256 bound = callback.buyerAssetsBound(bytes32(0), market, maker, _callbackData());
 
-        assertGt(bound, 3_500e6, "bound does not reflect a ~4k position");
-        assertLt(bound, 4_100e6, "bound exceeds what was parked");
+        assertGt(bound, 100e6, "bound collapsed to nothing on a venue that can still trade");
+        assertLt(bound, 500e6, "bound ignores the depth of the venue it has to sell into");
     }
 
     function test_buyerAssetsBoundIncludesTheBuffer() public {

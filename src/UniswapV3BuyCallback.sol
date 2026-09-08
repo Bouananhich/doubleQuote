@@ -52,10 +52,11 @@ import {SourcingMathLib} from "./libraries/SourcingMathLib.sol";
 /// overlooked: D7's griefing test needs an unprotected version to attack so the loss can be
 /// quantified, and D8 then wires the reference in and re-runs the same test.
 ///
-/// @dev The burn sizing itself accounts for the swap fee but not for price impact, so it can come
-/// up short on a thin venue; `_sourceLoanToken` falls back to unwinding the remainder rather than
-/// failing a fill the position could have covered. Modelling the impact properly is D5/D6, and it
-/// is what removes the fallback.
+/// @dev **The two halves are modelled differently, on purpose.** `buyerAssetsBound` simulates the
+/// whole unwind and bisects for the largest honest fill — it is a `view`, so it can. The burn
+/// sizing inside `onBuy` runs on the taker's gas and settles for the fee plus a flat 25bp impact
+/// margin, with a bounded escalation when that comes up short. Model in the view, execute in the
+/// callback.
 contract UniswapV3BuyCallback is UniswapBuyCallbackBase, IUniswapV3BuyCallback, IUniswapV3SwapCallback {
     using SafeCast for uint256;
 
@@ -241,31 +242,52 @@ contract UniswapV3BuyCallback is UniswapBuyCallbackBase, IUniswapV3BuyCallback, 
 
     /// QUOTING ///
 
-    /// @dev **Naive.** Position amounts at spot, plus uncollected fees, plus the residual converted
-    /// at spot — no price impact, no swap fee, no reference to `PRICE_REF`. It over-promises, and
-    /// by how much is the interesting question: D5 replaces it with the single-step version (exact
-    /// on the stable venue, where a small residual never leaves the active tick range), D6 with the
-    /// multi-tick walk, and D8 makes it reference-relative.
+    /// @dev **The single-step bound, D5.** Simulates the actual unwind — burn `dL`, sell the
+    /// residual on the route venue against a book that `dL` may itself have thinned — and bisects
+    /// on `dL` for the largest fill whose cost stays inside `MAX_SLIPPAGE_WAD`. See
+    /// `SourcingMathLib.boundBySlippage`; D6 replaces the single step with a tick walk and D8 makes
+    /// the cost reference-relative rather than route-spot-relative.
+    ///
+    /// @dev This reads the *route* pool as well as the parked one, and that is the point: the
+    /// residual is sold there, not where it came from. When the two are the same pool the burn also
+    /// thins the book, which the model accounts for; when they are not, it does not.
     function _sourceableBound(address loanToken, bytes memory data) internal view override returns (uint256) {
         PositionState memory position = _position(abi.decode(data, (uint256)));
         bool loanIsToken0 = loanToken == position.token0;
         if (!loanIsToken0 && loanToken != position.token1) revert LoanTokenNotInPool();
 
+        address residualToken = loanIsToken0 ? position.token1 : position.token0;
+
+        // The residual has to be sellable on the immutable route venue or the unwind reverts, so
+        // the honest bound in that case is zero, not the position's paper value.
+        if (residualToken != ROUTE_TOKEN0 && residualToken != ROUTE_TOKEN1) return 0;
+        if (loanToken != ROUTE_TOKEN0 && loanToken != ROUTE_TOKEN1) return 0;
+
         address pool = IUniswapV3Factory(FACTORY).getPool(position.token0, position.token1, position.fee);
         (uint160 sqrtPriceX96,,,,,,) = IUniswapV3Pool(pool).slot0();
+        (uint160 routeSqrtPriceX96,,,,,,) = IUniswapV3Pool(ROUTE_POOL).slot0();
 
-        (uint256 amount0, uint256 amount1) = SourcingMathLib.amountsForLiquidity(
-            sqrtPriceX96,
-            TickMath.getSqrtPriceAtTick(position.tickLower),
-            TickMath.getSqrtPriceAtTick(position.tickUpper),
-            position.liquidity
+        uint256 bound = SourcingMathLib.boundBySlippage(
+            SourcingMathLib.BoundParams({
+                sqrtPriceX96: sqrtPriceX96,
+                sqrtLowerX96: TickMath.getSqrtPriceAtTick(position.tickLower),
+                sqrtUpperX96: TickMath.getSqrtPriceAtTick(position.tickUpper),
+                liquidity: position.liquidity,
+                loanIsToken0: loanIsToken0,
+                routeSqrtPriceX96: routeSqrtPriceX96,
+                routeLiquidity: IUniswapV3Pool(ROUTE_POOL).liquidity(),
+                routeFeePips: ROUTE_FEE,
+                residualIsRouteToken0: residualToken == ROUTE_TOKEN0,
+                routeIsParkVenue: pool == ROUTE_POOL,
+                maxSlippageWad: MAX_SLIPPAGE_WAD
+            })
         );
-        amount0 += position.owed0;
-        amount1 += position.owed1;
 
-        return loanIsToken0
-            ? amount0 + SourcingMathLib.quote1For0(amount1, sqrtPriceX96)
-            : amount1 + SourcingMathLib.quote0For1(amount0, sqrtPriceX96);
+        // Uncollected fees on the loan side come back with the `collect` every burn ends in, so
+        // they are sourceable without a swap. The residual side is left out on purpose: selling it
+        // is a swap the model has not sized, and a bound must never over-promise. It arrives as a
+        // bonus in the buffer instead.
+        return bound + (loanIsToken0 ? position.owed0 : position.owed1);
     }
 
     /// INTERNAL ///
