@@ -912,3 +912,63 @@ two different books across two different sets of crossed ticks, and those do not
 Worth flagging as a general shape: an exact identity that held because two things were both linear
 stops holding the moment either becomes real, and the honest move is to widen the tolerance and say
 why rather than to hunt for a number that makes 1% pass again.
+
+## 2026-09-08 — D6 review: the fallback reopened the hole the walk had just closed
+
+Review comment on the D6 PR: *"empty book falls back to the pre-D6 fail-open model — a route venue
+with no ticks beyond spot reopens the exact +25.33% fail-open D6 fixes."* Correct, and the tell was
+sitting in my own docstring: *"An empty `routeBook` is the D5 fallback… No adapter takes this path."*
+The second sentence was false.
+
+**The mistake was a representation one, not an arithmetic one.** I let one value — an empty array —
+carry two meanings that need opposite handling: *no book was read* (a library test calling
+`boundBySlippage` directly) and *the book was read and there is nothing in it* (a venue too sparse
+for `readBook` to find an initialized tick). Those are not close. The first is a test convenience;
+the second is a live route venue whose depth is unknown, which is the case where assuming the
+current `L` continues forever is at its most dangerous. The code could not tell them apart, so it
+picked the dangerous reading, silently, on precisely the venues the walk was written for.
+
+The fix is a deletion: `sourcedFor` always walks, an empty book prices nothing, and the bound is
+zero. **Unreadable is unquotable.** Worth noting that no fork test failed when the fallback came
+out — the adapters' pinned numbers are all unchanged — which is the point. The path was unreachable
+on *these* pools and reachable on a sparser one, and no measurement here would ever have said so.
+
+**What the fallback was actually buying** was that nineteen D5-era library tests could keep calling
+`_params(...)` without a book. That is now paid for honestly, in the test file where it belongs: the
+default `_params` carries a book whose first boundary sits 5,000 ticks out, far past anything those
+residuals can reach, so the walk provably crosses nothing and reduces to the closed-form single
+step. The old numbers still hold and now mean something more specific — *this venue is deep enough
+that the book does not bite* rather than *no book was consulted*.
+
+One behaviour genuinely changed. A route venue with zero active liquidity used to quote the direct
+side under a 100% budget, on the sound reasoning that a maker authorising the loss of the entire
+residual can still source the loan-token half. It now quotes zero at every budget. The reasoning is
+still sound; what it lost is the model's standing to assert it, because a venue with no active
+liquidity is one the walk cannot price at all. Under-reporting is the safe direction and the
+deployable ceiling on `MAX_SLIPPAGE_WAD` is 10%, so nothing reachable is lost. The old test for it
+had quietly gone **vacuous** — both sides of its equality became zero and it kept passing — which is
+the third time this project has caught that shape, and the reason the replacement asserts a non-zero
+control alongside the zero.
+
+**Second finding: the bitmap search had no direct tests.** Also correct. It is arithmetic copied by
+hand, because v4-core's `nextInitializedTickWithinOneWord` takes the bitmap as a `mapping storage`
+and is therefore uncallable by anyone reading another contract's bitmap through a getter — and v3
+and v4 formulate the masks differently, so "copy the one from the repo" is already ambiguous. The
+only thing checking it was a fork test asserting a bound several layers downstream, which would
+have surfaced an off-by-one in the word arithmetic as a slightly wrong number.
+
+Nine tests now cover it against a `MockTickSource` — a bitmap whose initialized ticks are chosen
+rather than inherited from a live pool: ordering outward from spot in both directions, the
+`liquidityNet` sign flip, continuation across a word boundary, negative ticks and negative word
+indices, the current tick being inclusive downward and exclusive upward, the empty book, the
+`MAX_STEPS` truncation, and a fuzz over strict ordering.
+
+**They all passed on the first run, which is not evidence.** Mutation-tested before being believed:
+dropping the sign flip fails 2, an off-by-one on the downward cursor fails 8, and a one-bit error in
+the upward mask fails 6. That check is now the habit — a probe has to be made to fail on purpose
+before its output means anything.
+
+**173/173.** Removing the fallback also took ~280 bytes off each adapter, since `singleStepOut` left
+the production path with it. It stays in the library as an *independent* formula: the walk must
+reproduce it to the wei for a swap that crosses nothing, which is the only test that would catch the
+two disagreeing about the fee or the rounding.

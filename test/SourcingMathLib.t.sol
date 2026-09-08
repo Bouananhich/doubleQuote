@@ -208,6 +208,16 @@ contract SourcingMathLibTest is Test {
 
     /// SINGLE-STEP BOUND ///
 
+    /// @dev The book every `_params` case carries unless a test replaces it: four boundaries
+    /// starting 5,000 ticks above spot. No residual any position here can produce reaches the first
+    /// one — the worst case is a full burn against the thinnest route venue these tests use, which
+    /// moves the price ~200 ticks — so the walk provably crosses nothing and reduces to the
+    /// closed-form single step. That is what keeps the D5 numbers below meaningful after D6: they
+    /// are still measuring the same arithmetic, on a venue deep enough that the book never bites.
+    function _deepBook() internal pure returns (SourcingMathLib.TickStep[] memory) {
+        return _book(5000, 1000, 4, -1e15);
+    }
+
     /// @dev A deep venue: the position is a thousandth of the book, so its residual barely moves it.
     function _params(uint128 routeLiquidity, bool routeIsParkVenue, uint256 budgetWad)
         internal
@@ -225,15 +235,12 @@ contract SourcingMathLibTest is Test {
             routeFeePips: FEE_100,
             residualIsRouteToken0: false,
             routeIsParkVenue: routeIsParkVenue,
-            routeBook: new SourcingMathLib.TickStep[](0),
+            routeBook: _deepBook(),
             maxSlippageWad: budgetWad
         });
     }
 
-    /// @dev The D5 tests all run with no book, which is the documented degenerate case: the single
-    /// step, assuming `routeLiquidity` continues forever. Kept deliberately rather than retrofitted
-    /// — they are what the walk is checked *against* where the two have to agree, and the adapters
-    /// are where the book being present is enforced.
+    /// @dev Replaces the deep default with a book that actually bites.
     ///
     /// @dev Mutates and returns the same struct: `BoundParams` is a memory reference, so a caller
     /// wanting both answers has to build the params twice rather than reuse one.
@@ -371,18 +378,20 @@ contract SourcingMathLibTest is Test {
     /// total loss and only the loan-token side of the burn survives. Under any realistic budget
     /// that whole-residual loss blows through the ratio at every `dL`, and the quote is zero.
     ///
-    /// @dev It is *not* zero under a 100% budget, and that is consistent rather than a gap: a maker
-    /// who authorises losing everything on the swap really can still source the direct side. The
-    /// deployable ceiling on `MAX_SLIPPAGE_WAD` is 10%, so no deployment can ask for that.
-    function test_anEmptyRouteVenueQuotesNothingUnderARealBudget() public pure {
+    /// @dev It is zero at *every* budget, including one no deployment could set — which changed
+    /// with D6 and is worth stating rather than letting the assertion pass quietly. Before the walk
+    /// this quoted the direct side under a 100% budget, on the reasoning that a maker authorising
+    /// the loss of the whole residual can still source the loan-token half. That reasoning still
+    /// holds; what no longer holds is the model's right to assert it, because a venue with no
+    /// active liquidity is one whose book the walk cannot price at all. Under-reporting is the
+    /// direction a bound may err in, and the deployable ceiling on `MAX_SLIPPAGE_WAD` is 10%, so
+    /// nothing reachable is lost.
+    function test_anEmptyRouteVenueQuotesNothingAtAnyBudget() public pure {
         assertEq(SourcingMathLib.boundBySlippage(_params(0, true, 0.0001e18)), 0, "quoted against an empty route venue");
+        assertEq(SourcingMathLib.boundBySlippage(_params(0, true, 1e18)), 0, "an unreadable venue is not quotable");
 
-        (uint256 direct,) = SourcingMathLib.sourcedFor(_params(0, true, 1e18), LIQUIDITY);
-        assertEq(
-            SourcingMathLib.boundBySlippage(_params(0, true, 1e18)),
-            direct,
-            "a 100% budget should still reach the loan-token side"
-        );
+        // Not vacuous: the same position over a venue that *has* a book quotes plenty.
+        assertGt(SourcingMathLib.boundBySlippage(_params(1e24, false, 0.0001e18)), 0, "nothing quotes at all");
     }
 
     /// @dev **The dust floor.** A `dL` too small for the residual to survive rounding used to price
@@ -564,14 +573,30 @@ contract SourcingMathLibTest is Test {
         assertGt(walked, 0, "the partial output is still worth returning, it is just not a quote");
     }
 
-    /// @dev An empty book is *no book*, not an empty one, and the two have opposite answers. This
-    /// is the seam between the library's degenerate D5 path and the adapters, which always read a
-    /// book — `multiStepOut` refuses, and `boundBySlippage` only falls back to the single step
-    /// because `routeBook.length == 0` is a distinct case one level up.
-    function test_anEmptyBookIsRefusedRatherThanTreatedAsUnlimited() public pure {
+    /// @dev **The regression test for the review's critical finding.** `boundBySlippage` used to
+    /// fall back to the single step when `routeBook` was empty, on the reasoning that an empty book
+    /// meant *no book was read* and only library tests could produce one. Wrong on the second half:
+    /// `TickBookLib.readBook` returns an empty array whenever it finds no initialized tick, so a
+    /// real adapter over a sparse venue reached it — and it is the pre-D6 model, so it reopened the
+    /// +25.33% fail-open on exactly the venues the walk exists for. The fallback is gone. An empty
+    /// book prices nothing, at the swap and at the bound.
+    ///
+    /// @dev Deliberately asserted at both levels. `multiStepOut` refusing is not enough on its own:
+    /// the bug was one layer up, in what `sourcedFor` did with the refusal.
+    function test_anEmptyBookQuotesNothingRatherThanFallingBackToTheSingleStep() public pure {
         (,, bool complete) = SourcingMathLib.multiStepOut(_swap(1e18, 1e15, new SourcingMathLib.TickStep[](0)));
-
         assertFalse(complete, "an empty book priced a swap it knew nothing about");
+
+        SourcingMathLib.BoundParams memory p = _params(1e24, false, 0.001e18);
+        assertGt(SourcingMathLib.boundBySlippage(p), 0, "the deep-book control quoted nothing");
+
+        assertEq(
+            SourcingMathLib.boundBySlippage(
+                _withBook(_params(1e24, false, 0.001e18), new SourcingMathLib.TickStep[](0))
+            ),
+            0,
+            "an unreadable venue fell back to assuming its liquidity continues"
+        );
     }
 
     /// @dev A gap between two liquidity ranges is ordinary, not the end of the book: the pool skips

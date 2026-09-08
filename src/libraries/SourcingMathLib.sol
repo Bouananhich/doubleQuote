@@ -246,9 +246,8 @@ library SourcingMathLib {
         uint128 routeLiquidity;
         uint24 routeFeePips;
         /// @dev The route venue's initialized ticks outward from spot, in the direction the
-        /// residual travels. Empty means *no book was read*, not *the book is empty*: the model
-        /// then falls back to the single step, which assumes `routeLiquidity` continues forever and
-        /// therefore over-promises off-range. Every adapter passes one; see `TickBookLib`.
+        /// residual travels. Empty is not a special case and gets no fallback: a book with nothing
+        /// in it prices nothing, and the bound is zero. See `TickBookLib`.
         TickStep[] routeBook;
         /// @dev Whether the residual is the *route* pool's token0. Sorting can differ between the
         /// two venues, so this is not derivable from `loanIsToken0`.
@@ -262,13 +261,16 @@ library SourcingMathLib {
 
     /// @notice Output of an exact-input swap that does not leave the active tick range.
     ///
-    /// @dev This is `SwapMath.computeSwapStep` with the target price removed: one step, constant
-    /// `liquidity`, no tick crossing. Exact whenever the swap really does stay inside the range —
-    /// which for a small residual on a stable pair it does, and which is precisely the case D5
-    /// claims. Outside it, this assumes `liquidity` continues forever in the direction of travel,
-    /// so it **over**-estimates against a book that thins out. D6's tick walk is what removes the
-    /// assumption; until then the caller's slippage budget is what keeps the swap small enough for
-    /// it to hold.
+    /// @dev `SwapMath.computeSwapStep` with the target price removed: one step, constant
+    /// `liquidity`, no tick crossing. Exact whenever the swap really does stay inside the range,
+    /// and **over**-estimating whenever it does not, because it assumes `liquidity` continues
+    /// forever in the direction of travel.
+    ///
+    /// @dev **No longer part of the bound.** D6 routes every quote through `multiStepOut`, and this
+    /// is deliberately not kept as a fallback — see `_routeOut`. What it is kept for is being an
+    /// *independent* formula: the walk must reproduce it to the wei for a swap that crosses nothing
+    /// (`SourcingMathLib.t.sol`), which is the only check that would catch the two of them
+    /// disagreeing about the fee or the rounding.
     ///
     /// @param liquidityRemoved Liquidity burnt out of this same venue immediately beforehand.
     /// Finding A: the burn does not move `sqrtPriceX96`, it reduces the `L` the swap executes
@@ -503,27 +505,17 @@ library SourcingMathLib {
     /// through and take whatever the book really held, which is the number this model just failed
     /// to produce.
     ///
-    /// @dev An empty `routeBook` is the D5 fallback: no book was read, so the single step assumes
-    /// `routeLiquidity` continues. It is kept because it is the degenerate case the walk must agree
-    /// with in range, and because it is what every library test written before D6 exercises. No
-    /// adapter takes this path.
+    /// @dev **There is no fallback, and there must not be one.** An empty `routeBook` is a route
+    /// venue whose book this model could not see, and that is the case where assuming the current
+    /// `L` continues is *most* dangerous, not least — it is the pre-D6 model, reachable exactly
+    /// when the venue is too sparse to read. `readBook` returns an empty array whenever it finds no
+    /// initialized tick, so a fallback here would quietly reopen the +25.33% fail-open on precisely
+    /// the venues D6 exists for. Unreadable is unquotable.
     function _routeOut(BoundParams memory p, uint256 residual, uint128 dL)
         private
         pure
         returns (uint256 got, bool priceable)
     {
-        if (p.routeBook.length == 0) {
-            (uint256 single,) = singleStepOut(
-                p.routeSqrtPriceX96,
-                p.routeLiquidity,
-                p.routeFeePips,
-                p.residualIsRouteToken0,
-                residual,
-                _selfThinning(p, dL)
-            );
-            return (single, true);
-        }
-
         uint128 burnt = _selfThinning(p, dL);
         uint128 active = p.routeLiquidity > burnt ? p.routeLiquidity - burnt : 0;
 

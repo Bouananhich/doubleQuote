@@ -136,7 +136,7 @@ real adapter. Closing that found both of the following. **155/155.**
 
 `SourcingMathLib.multiStepOut` walks the route venue's initialized ticks with
 `SwapMath.computeSwapStep`; `TickBookLib` reads the book once, in the direction the residual travels,
-and hands it over as a flat array. Live on all three adapters. **164/164.**
+and hands it over as a flat array. Live on all three adapters. **173/173.**
 
 - **The fail-open case is closed.** Same position, same 10bp budget, routed through the thin 0.05%
   pool: the single step quoted **19,854.752510** and that reverted; the walk quotes
@@ -151,7 +151,14 @@ and hands it over as a flat array. Live on all three adapters. **164/164.**
 - Read once and bisect over it, rather than walking inside the swap: `boundBySlippage` evaluates the
   residual up to 128 times, so this is `O(ticks)` instead of `O(ticks × 128)`, and `SourcingMathLib`
   stays `pure` and venue-agnostic. The two venue-specific reads are passed in as function pointers.
-- ~3.3KB of runtime per adapter, all of it in the view. `onBuy` is untouched.
+- ~3.0KB of runtime per adapter, all of it in the view. `onBuy` is untouched.
+
+**Review:** the walk had a fallback for an empty book that reopened the fail-open it was written to
+close — `readBook` returns an empty array for a venue too sparse to read, and the fallback then
+assumed liquidity continued forever, which is the pre-D6 model on exactly the venues D6 exists for.
+Removed: unreadable is unquotable. The bitmap search also gained the direct unit tests it should
+have had — it is arithmetic copied by hand from a library that cannot be called from outside a
+pool, and it was only being checked several layers downstream by a fork test.
 
 **Next:** D7 — the griefing test on v3. Note that D6 changed what it is testing against: the bound
 now refuses to quote a fill the route venue cannot absorb, so an attacker who moves the pool is
