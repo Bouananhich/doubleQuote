@@ -256,6 +256,59 @@ contract UniswapV4NftBuyCallbackTest is V4ParkedBase {
         assertLt(bound, 500e6, "bound ignores the depth of the venue it has to sell into");
     }
 
+    /// @dev A second callback over the same NFT, differing only in budget and route venue. Possible
+    /// here and not on the custodial adapter, where a position belongs to whichever callback parked
+    /// it — which is why this branch is covered on this side. `_boundFor` and the
+    /// `routeIsParkVenue` derivation both live in `UniswapV4BuyCallbackBase` and are shared verbatim
+    /// with `UniswapV4BuyCallback`, so what is exercised here is the quoting path of both.
+    function _routedCallback(uint256 budgetWad, PoolKey memory route, uint256 salt)
+        internal
+        returns (UniswapV4NftBuyCallback routed)
+    {
+        routed = UniswapV4NftBuyCallback(factory.createCallback(maker, priceRef, budgetWad, route, bytes32(salt)));
+    }
+
+    /// @dev **`routeIsParkVenue == false`, through the adapter — and here the flag flips the
+    /// *ordering*, not just the number.** Everywhere else the route venue is the parked venue, so
+    /// the flag is only ever `true` and the adapter's own derivation of it is never exercised.
+    ///
+    /// @dev At a budget wide enough that capacity binds, the same-venue callback quotes **less**
+    /// than the one routing elsewhere — the opposite of the v3 comparison, and for a reason worth
+    /// stating. Routing into its own pool means burning thins the book, so
+    /// `MAX_ACTIVE_SHARE_WAD` caps the burn at half the pool's active liquidity: 665.88e9 against a
+    /// position of 788.96e9, or 84.4% of it. Routing elsewhere thins nothing there, so no cap
+    /// applies and the whole position is reachable. The quotes come out in exactly that ratio.
+    ///
+    /// @dev A flag stuck `true` would cap both and lose the gap; stuck `false` would cap neither.
+    function test_theActiveShareCapAppliesOnlyWhenTheRouteIsTheParkedVenue() public {
+        uint256 capped =
+            _routedCallback(0.05e18, poolKey, 30).buyerAssetsBound(bytes32(0), market, maker, _callbackData());
+        uint256 uncapped = _routedCallback(0.05e18, usdcUsdtRouteKey(), 31)
+            .buyerAssetsBound(bytes32(0), market, maker, _callbackData());
+
+        assertLt(capped, uncapped, "the active-share cap did not bind on the same-venue route");
+
+        // The gap is the cap and nothing else: half the pool's active liquidity over the whole
+        // position. Derived from live state rather than hard-coded, so it stays true if the fork
+        // block moves.
+        uint256 capRatio = (uint256(_activeLiquidity() / 2) * 1e18) / _liquidityFor(PARKED_USDC, PARKED_USDT);
+        assertApproxEqRel((capped * 1e18) / uncapped, capRatio, 0.01e18, "the gap is not the active-share cap");
+    }
+
+    /// @dev The other side of the same flag. Once the budget binds instead of capacity, the ordering
+    /// reverses: routing through the thinner, five-times-dearer 0.05% pool quotes **less**, because
+    /// now what limits the fill is what the residual costs to sell rather than how much of the book
+    /// the maker may burn. Same two callbacks, same position, opposite answer.
+    function test_aThinnerRouteVenueQuotesLessOnceTheBudgetBinds() public {
+        uint256 here =
+            _routedCallback(0.001e18, poolKey, 32).buyerAssetsBound(bytes32(0), market, maker, _callbackData());
+        uint256 there = _routedCallback(0.001e18, usdcUsdtRouteKey(), 33)
+            .buyerAssetsBound(bytes32(0), market, maker, _callbackData());
+
+        assertLt(there, here, "a thinner, dearer route venue did not cost the maker size");
+        assertGt(there, 0, "the thinner venue quoted nothing at all");
+    }
+
     function test_buyerAssetsBoundIsZeroForAnyBuyerButOwner() public view {
         assertEq(callback.buyerAssetsBound(bytes32(0), market, address(0xdead), _callbackData()), 0);
     }

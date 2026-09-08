@@ -210,6 +210,11 @@ contract MidnightIntegrationTest is ParkedPositionBase {
     /// @dev The budget does not bind at this size — the maker's position is 1% of the pool's active
     /// liquidity, so the whole thing unwinds inside 1bp and the bound is the full position. What
     /// changed is that it is now the *sourceable* full position rather than the paper one.
+    ///
+    /// @dev Exact **here**, and the qualifier is load-bearing: this callback routes through the pool
+    /// it parks in, so the residual swap never leaves the active tick range. Point the same position
+    /// at a thinner route venue and the single step over-promises by a quarter — see
+    /// `UniswapV3BuyCallback.test_theSingleStepOverPromisesOnARouteVenueItsSwapWalksOutOf`.
     function test_theBoundIsExactlyWhatSettles() public {
         uint256 bound = callback.buyerAssetsBound(bytes32(0), market, maker, _callbackData());
         assertGt(bound, 19_000e6, "bound does not reflect a ~19.9k position");

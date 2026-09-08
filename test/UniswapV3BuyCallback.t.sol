@@ -303,6 +303,23 @@ contract UniswapV3BuyCallbackTest is ParkedPositionBase {
         assertEq(IERC20Meta(USDC).balanceOf(address(callback)), 1_000e6, "buffer was spent");
     }
 
+    /// @dev A second callback over the same parked position, differing only in budget and route.
+    function _routedCallback(uint256 budgetWad, address routePool, uint256 salt)
+        internal
+        returns (UniswapV3BuyCallback routed)
+    {
+        routed = UniswapV3BuyCallback(factory.createCallback(maker, priceRef, budgetWad, routePool, bytes32(salt)));
+    }
+
+    /// @dev ERC-721 approval is a single slot per `tokenId`, so approving one callback revokes the
+    /// last. Every use site approves at the point of use; approving inside `_routedCallback` would
+    /// silently disarm whichever callback was built first, and an `onBuy` that reverts on approval
+    /// satisfies any assertion about what it sourced by never running.
+    function _approve(UniswapV3BuyCallback routed) internal {
+        vm.prank(maker);
+        INonfungiblePositionManager(V3_POSITION_MANAGER).approve(address(routed), tokenId);
+    }
+
     /// QUOTING ///
 
     /// @dev The budget does not bind on this venue: the maker's position is 1% of the pool's active
@@ -323,16 +340,108 @@ contract UniswapV3BuyCallbackTest is ParkedPositionBase {
     function test_aTighterBudgetQuotesLess() public {
         uint256 atOneBp = callback.buyerAssetsBound(bytes32(0), market, maker, _callbackData());
 
-        UniswapV3BuyCallback tight = UniswapV3BuyCallback(
-            factory.createCallback(maker, priceRef, 0.000001e18, POOL_USDC_USDT_100, bytes32(uint256(11)))
+        // 0.6bp. Below about 0.5bp the route fee alone exceeds the budget and the honest answer
+        // is zero at every size — see `test_aRouteFeeAboveTheBudgetQuotesNothingAtAnySize`.
+        uint256 atSixTenthsBp = _routedCallback(0.00006e18, POOL_USDC_USDT_100, 11)
+            .buyerAssetsBound(bytes32(0), market, maker, _callbackData());
+
+        assertLt(atSixTenthsBp, atOneBp, "a tighter budget did not reduce the bound");
+        assertGt(atSixTenthsBp, 0, "a tighter budget collapsed the bound entirely");
+    }
+
+    /// @dev **`routeIsParkVenue == false`, through the adapter.** Everything else quotes a callback
+    /// whose route venue *is* its parking venue, so the flag the bound turns on is only ever `true`
+    /// and the adapter's own derivation of it — `pool == ROUTE_POOL` — goes unexercised. Wire it
+    /// backwards and every other test still passes.
+    ///
+    /// @dev Two callbacks, identical but for the route pool, quoting the same position at the same
+    /// budget. Routing through the 0.05% pool — same pair, ~50x thinner, five times the fee — costs
+    /// the maker **16.706342 USDC** of quotable size. The adapter is reading the venue the residual
+    /// will actually be sold on, not the one it came out of.
+    function test_theBoundReadsTheRouteVenueRatherThanTheParkedOne() public {
+        uint256 boundHere = _routedCallback(0.001e18, POOL_USDC_USDT_100, 20)
+            .buyerAssetsBound(bytes32(0), market, maker, _callbackData());
+        uint256 boundThere = _routedCallback(0.001e18, POOL_USDC_USDT_500, 21)
+            .buyerAssetsBound(bytes32(0), market, maker, _callbackData());
+
+        assertLt(boundThere, boundHere, "a thinner, dearer route venue did not cost the maker size");
+        assertEq(boundHere - boundThere, 16_706342, "the gap between the two venues moved");
+    }
+
+    /// @dev **Where the single step stops being exact, measured.** The library's docstring says the
+    /// bound is exact while the residual swap stays inside the route venue's active tick range and
+    /// over-estimates when it does not. Routing through the 0.05% pool is a config where it does
+    /// not: ~9,930 USDT into 7.57e12 of liquidity moves the price about 13bp, past initialized
+    /// ticks, and beyond them the book is thinner than a single step assumes.
+    ///
+    /// @dev The result is a **25.33% over-promise** — 19,854.752510 quoted against 14,824.408869
+    /// the position can really source. That is the *dangerous* direction: the bound fails open, and
+    /// a taker who believes it gets a reverted transaction. Compare the same position routed through
+    /// its own pool, where the swap stays in range and the quote is exact to the wei
+    /// (`MidnightIntegration.test_theBoundIsExactlyWhatSettles`).
+    ///
+    /// @dev This is D6's case, and it is worth noting that it did **not** need the volatile venue
+    /// `PLAN.md` expected it to need — a thinner pool on the same stable pair is enough. Pinned
+    /// rather than fixed: the tick walk is a day's work, and until it lands this is the shape and
+    /// size of the error a maker takes on by routing somewhere thin.
+    function test_theSingleStepOverPromisesOnARouteVenueItsSwapWalksOutOf() public {
+        UniswapV3BuyCallback elsewhere = _routedCallback(0.001e18, POOL_USDC_USDT_500, 25);
+        uint256 bound = elsewhere.buyerAssetsBound(bytes32(0), market, maker, _callbackData());
+
+        assertEq(bound, 19_854_752510, "the quoted bound moved");
+
+        // The quote itself does not settle.
+        _approve(elsewhere);
+        vm.expectRevert(IUniswapV3BuyCallback.InsufficientSourced.selector);
+        vm.prank(MIDNIGHT);
+        elsewhere.onBuy(bytes32(0), market, bound, 0, 0, maker, _callbackData());
+
+        // What does settle is a quarter less. Both sides pinned, so a change in either direction —
+        // the model improving or the error growing — shows up here rather than passing quietly.
+        _approve(elsewhere);
+        vm.prank(MIDNIGHT);
+        elsewhere.onBuy(bytes32(0), market, 14_824_408869, 0, 0, maker, _callbackData());
+
+        assertEq((bound - 14_824_408869) * 10_000 / bound, 2533, "the over-promise changed size");
+    }
+
+    /// @dev The regression test for a real bug, found only once the bound was asked of a callback
+    /// routing somewhere other than where it parks.
+    ///
+    /// @dev The route fee is *proportional*: it costs the same fraction at every size, so a 5bp
+    /// venue under a 1bp budget has no honest bound at any `dL` and the only correct answer is
+    /// zero. It used to answer **1 wei** — the residual of a dust burn rounded away, the modelled
+    /// cost rounded to zero with it, and the bisection latched onto the one size that looked free.
+    /// That quote was wrong in both directions at once: `onBuy(1)` reverted as a dust fill, while
+    /// `onBuy(2)` succeeded. `SourcingMathLib` now refuses a residual it cannot price and floors
+    /// the modelled cost at the fee the venue is certain to charge.
+    function test_aRouteFeeAboveTheBudgetQuotesNothingAtAnySize() public {
+        UniswapV3BuyCallback starved = _routedCallback(MAX_SLIPPAGE_WAD, POOL_USDC_USDT_500, 22);
+
+        assertEq(
+            starved.buyerAssetsBound(bytes32(0), market, maker, _callbackData()),
+            0,
+            "quoted a size whose route fee alone exceeds the budget"
         );
-        vm.prank(maker);
-        INonfungiblePositionManager(V3_POSITION_MANAGER).approve(address(tight), tokenId);
+    }
 
-        uint256 atHundredthBp = tight.buyerAssetsBound(bytes32(0), market, maker, _callbackData());
+    /// @dev The bound is a *budget* limit, not a capacity limit, and on a thin route venue the two
+    /// come apart. At 5bp the quote is 7,443.568970 while the same callback settles half as much
+    /// again — the position can reach further, but not without spending more of the maker's price
+    /// than they signed for.
+    function test_theBoundIsABudgetLimitNotACapacityLimit() public {
+        UniswapV3BuyCallback tight = _routedCallback(0.0005e18, POOL_USDC_USDT_500, 23);
 
-        assertLt(atHundredthBp, atOneBp, "a tighter budget did not reduce the bound");
-        assertGt(atHundredthBp, 0, "a tighter budget collapsed the bound entirely");
+        uint256 atFiveBp = tight.buyerAssetsBound(bytes32(0), market, maker, _callbackData());
+        uint256 atTenBp = _routedCallback(0.001e18, POOL_USDC_USDT_500, 24)
+            .buyerAssetsBound(bytes32(0), market, maker, _callbackData());
+
+        assertGt(atFiveBp, 0, "the tighter budget quoted nothing at all");
+        assertLt(atFiveBp, atTenBp, "widening the budget did not raise the quote");
+
+        _approve(tight);
+        vm.prank(MIDNIGHT);
+        tight.onBuy(bytes32(0), market, atFiveBp + atFiveBp / 2, 0, 0, maker, _callbackData());
     }
 
     function test_buyerAssetsBoundIncludesTheBuffer() public {

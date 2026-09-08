@@ -781,3 +781,58 @@ in the direction of travel, so it over-estimates against a book that thins out p
 range. On the stable venue it does not, which is why the answer is exact. D6's tick walk removes the
 assumption; `singleStepOut` returns the post-swap price precisely so that assumption is checkable
 rather than trusted.
+
+## 2026-09-08 — D5 review: the bound was quoting 1 wei, and it over-promises off-range
+
+Review comment on the D5 PR: *"`routeIsParkVenue=false` is unit-tested in the library only, never
+through the real adapters."* Correct, and the gap was load-bearing. Every adapter-level bound test
+quoted a callback whose route venue *was* its parking venue, so the flag was only ever `true` and
+each adapter's own derivation of it went unexercised. Asking a distinct-route callback for a bound
+for the first time turned up two things.
+
+**A real bug: the bound returned 1 wei where the honest answer was zero.** A callback parked in the
+0.01% pool but routing through the 0.05% one, under the fixture's 1bp budget, has no honest bound at
+any size — the route fee alone is 5bp, and a fee is *proportional*, so it costs the same fraction of
+every fill. The bisection should have found nothing and returned 0. It returned 1.
+
+Two rounding doors, both leading to the same place. At a `dL` small enough, the residual rounds to
+zero, and `sourcedFor` returned `(direct, 0)` — zero cost, therefore inside any budget. Closing that
+one left the second: for a residual of a few wei, `quote1For0` *itself* rounds to zero, so the
+spot value the cost is measured against vanishes and the cost with it. Either way the bisection
+latched onto the one size that looked free.
+
+The quote was wrong in both directions at once — `onBuy(1)` reverted as a dust fill, while `onBuy(2)`
+succeeded. Fixed with two guards, both in `sourcedFor`: a residual that cannot be priced at all is
+not quotable (distinguished from a genuinely one-sided out-of-range position, which is free for real),
+and the modelled cost is floored at the fee the venue is certain to charge. The fee floor is the
+substantive one: it is what makes "this configuration admits no fill" come out as zero instead of dust.
+
+**A measured limitation, not a bug: off-range, the bound over-promises by 25%.**
+
+| route venue | bound | largest fill that settles | error |
+|---|---|---|---|
+| 0.01%, = park pool, 3.97e14 active | 19,871.458852 | 19,871.458852 | exact |
+| 0.05%, distinct, 7.57e12 active | 19,854.752510 | 14,824.408869 | **+25.33%** |
+
+The single step assumes the route venue's active liquidity continues in the direction of travel.
+Selling ~9,930 USDT into 7.57e12 moves the price about 13bp, past initialized ticks, and beyond them
+the book is thinner than that assumption. This was documented in `SourcingMathLib` from the start;
+what is new is the magnitude, and that it **fails open** — the direction a bound must never fail in.
+
+Two consequences. First, `PLAN.md` said the case for D6's tick walk "has to be made on the volatile
+venue". It does not: a thinner pool on the *same stable pair* makes it, which moves D6 from
+nice-to-have toward necessary. Second, a conservative cheap guard was considered and rejected —
+clamping the modelled swap to the current tick-spacing interval is sound, since liquidity only
+changes at multiples of the spacing, but the 0.01% pool has spacing 1, so it would refuse to quote
+almost anything on the venue where the model is provably exact. Distinguishing "a tick boundary" from
+"an *initialized* tick boundary" needs the bitmap, and that is D6. Pinned in a test with both numbers
+rather than half-fixed.
+
+**Method note.** Two of the measurements behind this were initially vacuous and would have shipped as
+confident numbers. A bisection helper written as `lo = from; while (hi - lo > 1) ...` never tests
+`from` itself, so when every call reverted it returned its own input unchanged — reporting the bound
+as the maximum fillable amount, which is exactly the claim under test. Separately, ERC-721 approval
+is a single slot per `tokenId`, so a helper that approved each new callback silently revoked the
+previous one, and an `onBuy` that reverts on approval satisfies any assertion about what it sourced
+by never running. Both produced *plausible* numbers. The lesson is narrow and worth keeping: a probe
+must be made to fail on purpose before its output is believed.

@@ -368,6 +368,55 @@ contract SourcingMathLibTest is Test {
         );
     }
 
+    /// @dev **The dust floor.** A `dL` too small for the residual to survive rounding used to price
+    /// as *free* — zero residual, therefore zero cost, therefore inside any budget. That is what let
+    /// a bisection return a bound of 1 wei on a config whose honest answer was zero at every size.
+    /// Below the model's resolution is not quotable.
+    function test_aBurnTooSmallToPriceIsNotQuotable() public pure {
+        (uint256 sourced, uint256 cost) = SourcingMathLib.sourcedFor(_params(1e24, false, 1e18), 1);
+
+        assertEq(sourced, 0, "a dust burn was quoted");
+        assertEq(cost, 0);
+    }
+
+    /// @dev The same rounding, but out of range, is not rounding at all: the position really is all
+    /// loan token, there is nothing to sell, and sourcing it really is free. The two cases have to
+    /// be told apart or the floor above would refuse a legitimate one-sided position.
+    function test_aOneSidedPositionOutOfRangeIsStillQuotable() public pure {
+        SourcingMathLib.BoundParams memory p = _params(1e24, false, 1e18);
+        p.sqrtPriceX96 = _upper() + 1; // above the range: all token1, and token1 is the residual
+
+        p.loanIsToken0 = false; // so the loan side is the one the position holds
+        (uint256 sourced, uint256 cost) = SourcingMathLib.sourcedFor(p, LIQUIDITY);
+
+        assertGt(sourced, 0, "an out-of-range position quoted nothing");
+        assertEq(cost, 0, "a position with no residual to sell was charged for selling it");
+    }
+
+    /// @dev **The fee floor.** The venue charges its fee whatever the arithmetic rounds to, so the
+    /// modelled cost may never come in under it. The fee is the *proportional* term — it costs the
+    /// same fraction at every size — so letting it round away is what turns "no honest bound at any
+    /// size" into a spurious dust quote.
+    function test_theModelledCostIsNeverBelowTheVenueFee() public pure {
+        SourcingMathLib.BoundParams memory p = _params(type(uint128).max, false, 1e18);
+
+        (, uint256 cost) = SourcingMathLib.sourcedFor(p, LIQUIDITY);
+
+        // A book this deep has no measurable impact, so the fee is all that is left — and it is
+        // still charged rather than rounded to nothing.
+        assertGt(cost, 0, "an effectively lossless swap was modelled as free");
+    }
+
+    /// @dev A route fee that exceeds the budget on its own admits no fill at any size, and the only
+    /// honest answer is zero. This is the shape of the bug the D5 review found: 5bp of route fee
+    /// against a 1bp budget quoted 1 wei, which then failed to settle.
+    function test_aFeeAboveTheBudgetQuotesNothingRatherThanDust() public pure {
+        SourcingMathLib.BoundParams memory p = _params(type(uint128).max, false, 0.0001e18);
+        p.routeFeePips = 500; // 5bp against a 1bp budget
+
+        assertEq(SourcingMathLib.boundBySlippage(p), 0, "quoted a size the route fee alone rules out");
+    }
+
     /// @dev Mirrors `bound.py`'s monotonicity check, which is what makes the bisection legitimate:
     /// inside the cap, burning more sources more and costs proportionally more. If this ever fails,
     /// `boundBySlippage` is searching a function it has no right to bisect.

@@ -101,9 +101,12 @@ GPL-2.0-or-later, so the derivative is too; the file headers already say so but 
 `SourcingMathLib.boundBySlippage`: simulate the unwind, bisect on how much liquidity to burn, subject
 to the slippage budget. Live on all three adapters. **145/145.**
 
-- **The bound is exact.** Against a real `take()` on the deployed Midnight, the quote is
-  19,871.458852 USDC and the largest settleable fill is 19,871.458852 — headroom **zero, to the
-  wei**, found by bisection and pinned in both directions (`bound` fills, `bound + 1` reverts).
+- **The bound is exact where the single step is valid.** Against a real `take()` on the deployed
+  Midnight, the quote is 19,871.458852 USDC and the largest settleable fill is 19,871.458852 —
+  headroom **zero, to the wei**, pinned in both directions (`bound` fills, `bound + 1` reverts).
+  That holds while the residual swap stays inside the route venue's active tick range. Routing the
+  same position through the thinner 0.05% pool, where it does not, the bound **over-promises by
+  25.33%** — see the review section below.
 - **The D4 caveat was the wrong reading.** "The naive bound is already within 0.63bp, so D5 has
   little to win" mistook *near* for *correct*. A 0.63bp optimistic bound hands a taker a reverted
   transaction; the routing layer is asynchronous by construction, which is why the bound exists.
@@ -115,10 +118,27 @@ to the slippage budget. Live on all three adapters. **145/145.**
   park and route are independently chosen here, so a burn thins the route venue only when it is the
   same pool and in range. `bound.py` models one pool and could assume it.
 
-**Next:** D6 — the multi-tick walk. The single step assumes the route venue's liquidity continues in
-the direction of travel; on the stable venue it does, which is why the answer is exact. Risk #2 says
-this is what gives if D4's overrun catches up, and the fallback is now much stronger than it was:
-the shipped bound is exact on the venue the demo runs on.
+### D5 review — one bug fixed, one limitation measured
+
+Review comment: `routeIsParkVenue=false` was covered in the library's unit tests but never through a
+real adapter. Closing that found both of the following. **155/155.**
+
+- **Bug, fixed.** A callback routing through a 5bp venue under a 1bp budget has no honest bound at
+  any size — a fee is proportional. It quoted **1 wei**, because at dust `dL` the residual and then
+  its spot valuation both round to zero, so the modelled cost vanished and the bisection took the
+  one size that looked free. `onBuy(1)` reverted while `onBuy(2)` settled: wrong in both directions
+  at once. `sourcedFor` now refuses a residual it cannot price and floors the cost at the venue fee.
+- **Limitation, measured and pinned.** Off-range the bound **fails open by 25.33%** (19,854.752510
+  quoted, 14,824.408869 settleable) on the 0.05% route pool, because the single step assumes active
+  liquidity continues past the ticks the swap actually crosses.
+
+**Next:** D6 — the multi-tick walk, and it is no longer optional in the way risk #2 assumed. The plan
+said the case for it "has to be made on the volatile venue"; it does not — a thinner pool on the same
+stable pair makes it, and a bound that fails open is the one failure mode the design cannot carry. A
+cheap conservative clamp was considered and rejected: liquidity only changes at multiples of the tick
+spacing, but the 0.01% pool has spacing 1, so clamping there would refuse to quote almost anything on
+the venue where the model is provably exact. Separating a tick boundary from an *initialized* one
+needs the bitmap, which is D6 itself.
 
 Build order is **v3 first, v4 second, both shipped**. v3 is load-bearing — its native
 `observe()` makes the price-reference work straightforward. If a day goes missing, v4 is cut,

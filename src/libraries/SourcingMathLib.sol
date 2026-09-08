@@ -278,7 +278,12 @@ library SourcingMathLib {
         (uint256 amount0, uint256 amount1) = amountsForLiquidity(p.sqrtPriceX96, p.sqrtLowerX96, p.sqrtUpperX96, dL);
         (uint256 direct, uint256 residual) = p.loanIsToken0 ? (amount0, amount1) : (amount1, amount0);
 
-        if (residual == 0) return (direct, 0);
+        // A zero residual means one of two very different things. Out of range, the position
+        // really is all loan token, there is nothing to swap, and sourcing it is genuinely free.
+        // *In* range it is a rounding artifact of a `dL` too small to express both sides — and
+        // pricing that as free is what lets a bisection latch onto dust and return a bound no fill
+        // can honour. Below the model's resolution is not quotable.
+        if (residual == 0) return _isInRange(p) ? (0, 0) : (direct, 0);
 
         (uint256 got,) = singleStepOut(
             p.routeSqrtPriceX96,
@@ -293,8 +298,20 @@ library SourcingMathLib {
             ? quote0For1(residual, p.routeSqrtPriceX96)
             : quote1For0(residual, p.routeSqrtPriceX96);
 
+        // A residual too small to price at all is below the model's resolution, and quoting it as
+        // free is how a bisection ends up returning dust. Not quotable.
+        if (atSpot == 0) return (0, 0);
+
         sourced = direct + got;
         cost = atSpot > got ? atSpot - got : 0;
+
+        // The venue charges its fee whatever the arithmetic rounds to, so the modelled cost may
+        // never come in under it. Without this floor the fee vanishes at small `dL` — and the fee
+        // is precisely the term that is *proportional*, so a config whose route fee alone exceeds
+        // the slippage budget has no honest bound at any size. Rounding it away turns that "zero"
+        // into a spurious dust quote.
+        uint256 feeFloor = FullMath.mulDivRoundingUp(atSpot, p.routeFeePips, 1e6);
+        if (cost < feeFloor) cost = feeFloor;
     }
 
     /// @notice The most liquidity `boundBySlippage` is allowed to consider burning.
@@ -315,10 +332,16 @@ library SourcingMathLib {
     ///
     /// @dev `sourcedFor` is increasing and its cost ratio is increasing in `dL` inside the cap, so
     /// the predicate flips once and bisection finds the flip. The one wrinkle is at the very
-    /// bottom: a `dL` small enough to round to zero output fails the predicate too, so the
-    /// predicate is false-then-true-then-false rather than monotone. That costs nothing here —
-    /// `lo` only ever advances on a *true*, so the search either finds the upper boundary or
-    /// returns 0. Under-reporting is the safe direction for a bound; over-reporting is not.
+    /// bottom: a `dL` small enough that the residual rounds away is not quotable, so the predicate
+    /// is false-then-true-then-false rather than monotone. That costs nothing — `lo` only ever
+    /// advances on a *true*, so the search either finds the upper boundary or returns 0.
+    /// Under-reporting is the safe direction for a bound; over-reporting is not.
+    ///
+    /// @dev The dust floor is load-bearing rather than tidy. Before `sourcedFor` refused it, a
+    /// `dL` whose residual rounded to zero priced as *free* and passed any budget, so a maker whose
+    /// route fee alone exceeded their slippage budget — where the honest answer is zero at every
+    /// size — got a bound of **1 wei** instead, and a fill of 1 wei then reverted. A bound that
+    /// small is not merely useless, it is wrong in both directions at once.
     function boundBySlippage(BoundParams memory p) internal pure returns (uint256) {
         uint128 hi = maxBurnableLiquidity(p);
         if (hi == 0) return 0;
@@ -346,8 +369,14 @@ library SourcingMathLib {
     /// when the two are the same pool *and* the position straddles the live tick, because an
     /// out-of-range position contributes nothing to active liquidity.
     function _thinsRoute(BoundParams memory p) private pure returns (bool) {
-        return p.routeIsParkVenue && p.routeLiquidity > 0 && p.sqrtPriceX96 >= p.sqrtLowerX96
-            && p.sqrtPriceX96 < p.sqrtUpperX96;
+        return p.routeIsParkVenue && p.routeLiquidity > 0 && _isInRange(p);
+    }
+
+    /// @dev Straddling the live tick, on exactly the boundaries `amountsForLiquidity` uses. The two
+    /// have to agree: an out-of-range position is one-sided there and contributes nothing to active
+    /// liquidity here, and a disagreement at the edge would be a silent wrong answer either way.
+    function _isInRange(BoundParams memory p) private pure returns (bool) {
+        return p.sqrtPriceX96 > p.sqrtLowerX96 && p.sqrtPriceX96 < p.sqrtUpperX96;
     }
 
     /// @dev How much of a `dL` burn comes out of the route venue's active liquidity.
