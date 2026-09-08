@@ -132,13 +132,31 @@ real adapter. Closing that found both of the following. **155/155.**
   quoted, 14,824.408869 settleable) on the 0.05% route pool, because the single step assumes active
   liquidity continues past the ticks the swap actually crosses.
 
-**Next:** D6 — the multi-tick walk, and it is no longer optional in the way risk #2 assumed. The plan
-said the case for it "has to be made on the volatile venue"; it does not — a thinner pool on the same
-stable pair makes it, and a bound that fails open is the one failure mode the design cannot carry. A
-cheap conservative clamp was considered and rejected: liquidity only changes at multiples of the tick
-spacing, but the 0.01% pool has spacing 1, so clamping there would refuse to quote almost anything on
-the venue where the model is provably exact. Separating a tick boundary from an *initialized* one
-needs the bitmap, which is D6 itself.
+## D6 — done
+
+`SourcingMathLib.multiStepOut` walks the route venue's initialized ticks with
+`SwapMath.computeSwapStep`; `TickBookLib` reads the book once, in the direction the residual travels,
+and hands it over as a flat array. Live on all three adapters. **164/164.**
+
+- **The fail-open case is closed.** Same position, same 10bp budget, routed through the thin 0.05%
+  pool: the single step quoted **19,854.752510** and that reverted; the walk quotes
+  **9,838.854693** and it settles.
+- **And it cost nothing where the model was already right.** On the 0.01% pool the answer is
+  unchanged to the wei — 19,871.458852, still exact against a real `take()` on deployed Midnight.
+- **The bound is now a solvency limit as well as a slippage limit.** The remaining gap to
+  14,824.408869, the largest fill that technically settles, is not headroom: that pool's whole book
+  above spot is eight ticks and its liquidity is spent by the last of them, so those fills go
+  through only by selling the residual into an empty pool. Widening the budget from 10bp to 5% does
+  not move the quote by a wei — what binds is the book.
+- Read once and bisect over it, rather than walking inside the swap: `boundBySlippage` evaluates the
+  residual up to 128 times, so this is `O(ticks)` instead of `O(ticks × 128)`, and `SourcingMathLib`
+  stays `pure` and venue-agnostic. The two venue-specific reads are passed in as function pointers.
+- ~3.3KB of runtime per adapter, all of it in the view. `onBuy` is untouched.
+
+**Next:** D7 — the griefing test on v3. Note that D6 changed what it is testing against: the bound
+now refuses to quote a fill the route venue cannot absorb, so an attacker who moves the pool is
+attacking a quote that already knows how deep the book is. The loss to quantify is what happens
+between the quote and the block, which is what `PRICE_REF` exists for at D8.
 
 Build order is **v3 first, v4 second, both shipped**. v3 is load-bearing — its native
 `observe()` makes the price-reference work straightforward. If a day goes missing, v4 is cut,
@@ -181,7 +199,7 @@ The prep window (Mon 31 Aug → Thu 3 Sep) was not used. These are prerequisites
 | **D3** (Sun 6) | Loan-token buffer ✅ (landed D1) + partial unwind ✅. Only touch the LP when the buffer can't cover the fill, and then only for the fill's share. Fixes dust-grief bleed; costs ~18k gas rather than saving it. |
 | **D4** (Mon 7) | **v4 happy path.** Whole unwind inside one `PoolManager.unlock()` — `modifyLiquidity`, swap residual, settle one netted delta. Naive `buyerAssetsBound` on both. |
 | **D5** (Tue 8) | `SourcingMathLib` single-step version ✅ — exact to the wei on the stable pool against a real `take()`. `max_share` cap included, and it binds on v4. |
-| **D6** (Wed 9) | Multi-tick walk (`TickBitmap` + `computeSwapStep`) for the volatile pool. Bisection on top. Cross-check against `bound.py` outputs. |
+| **D6** (Wed 9) | Multi-tick walk ✅ — `TickBookLib` + `computeSwapStep`, bisection on top. The +25.33% fail-open on a thin route venue is gone; the deep venue is unchanged to the wei. |
 | **D7** (Thu 10) | **The griefing test**, on v3. Attacker moves the pool, takes the offer, callback swaps into the manufactured price. Quantify the maker's loss. |
 
 ## Week 2 — Fri 11 → Fri 18 Sep
@@ -238,9 +256,12 @@ artifact aimed squarely at a Uniswap judge.
 1. **Two venues doubles the surface.** Mitigated by the abstract base + shared math lib. If the
    adapters share less than ~two-thirds of their logic, the abstraction is wrong and v4 should be
    dropped rather than forced.
-2. **The tick-walk implementation overruns D6.** Fallback: ship the single-step version plus a
-   slippage guard, and present the multi-tick version as designed-but-unshipped, with `bound.py`
-   as evidence it works.
+2. ~~**The tick-walk implementation overruns D6.**~~ **Retired — shipped on D6.** Recorded for the
+   post-mortem: the risk was ranked second because the walk looked like the expensive, optional
+   half. It was neither. It came in inside the day, and it was not optional — the single step
+   failed *open* by 25.33% on a thin route venue, which is the one direction a bound may not err
+   in. The fallback this entry proposed, "ship the single step plus a slippage guard", was the
+   wrong fallback: the slippage guard was already there and it was what got fooled.
 3. **The oracle work becomes a rabbit hole.** Timebox hard. `V3TwapRef` must exist;
    `TruncatedOracleRef` makes the comparison interesting; `MedianRef` is decoration. Cut from the
    right. Budget half a day for hook address mining.

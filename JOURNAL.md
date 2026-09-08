@@ -836,3 +836,79 @@ is a single slot per `tokenId`, so a helper that approved each new callback sile
 previous one, and an `onBuy` that reverts on approval satisfies any assertion about what it sourced
 by never running. Both produced *plausible* numbers. The lesson is narrow and worth keeping: a probe
 must be made to fail on purpose before its output is believed.
+
+## 2026-09-08 — D6: the tick walk, and what the fail-open number was actually measuring
+
+D5 left the bound exact on the deep venue and **+25.33% optimistic** on a thin one, for a single
+stated reason: the single step assumes the route venue's active liquidity continues in the direction
+of travel, and a concentrated pool's does not. D6 replaces the assumption with a read.
+
+**The shape: a snapshot, not a live walk.** `TickBookLib` reads the route venue's initialized ticks
+once, outward from spot in the direction the residual will be sold, into a flat
+`SourcingMathLib.TickStep[]`; `multiStepOut` then walks that array with `SwapMath.computeSwapStep`,
+crossing ticks and applying each one's `liquidityNet`. Three reasons it is a snapshot rather than the
+pool's own loop, in order of weight:
+
+1. **`boundBySlippage` bisects.** It evaluates the residual swap up to 128 times. Reading the book
+   inside the swap would make the state reads `O(ticks × 128)`; reading it once makes them
+   `O(ticks)`. This is decisive on its own.
+2. It keeps `SourcingMathLib` `pure` and venue-agnostic — the library never learns whether the ticks
+   came from a v3 pool's storage or a v4 `PoolManager`.
+3. It makes the walk testable without a fork, which is where six of the nine new tests live.
+
+The two reads that *are* venue-specific — one bitmap word, one tick's `liquidityNet` — are passed to
+`TickBookLib.readBook` as `internal view` function pointers. That writes the walk once for three
+adapters with no wrapper contract and no venue enum. It is an unusual construct and it earns its
+place here: v3 and v4 differ in exactly those two lines and nothing else.
+
+**Running out of book is not an error, and is never extrapolated over.** The book is finite
+(`MAX_STEPS = 128`). A swap that walks off the end comes back `complete = false`, and `sourcedFor`
+treats an incomplete walk as *unpriceable* rather than as worth its partial output — so the
+bisection shrinks `dL` until the residual fits inside liquidity that was actually read. This is the
+whole of the fix. The failure mode being removed is precisely a model that assumed what it could not
+see, and replacing one assumption with a smaller one would have removed nothing.
+
+**Results.** Same fork, same position, same 10bp budget:
+
+| route venue | D5 bound | D6 bound | largest fill that settles |
+|---|---|---|---|
+| 0.01%, = park pool, 3.97e14 active | 19,871.458852 | 19,871.458852 | 19,871.458852 |
+| 0.05%, distinct, 7.57e12 active | 19,854.752510 (reverts) | 9,838.854693 (settles) | 14,824.408869 |
+
+The first row is the important one: **the walk costs nothing where the single step was already
+right**, still exact to the wei against a real `take()` on the deployed Midnight. The fail-open case
+is gone.
+
+**What the remaining 9,838 → 14,824 gap is, since it is not headroom.** The 0.05% pool's entire book
+above spot is *eight* initialized ticks, and its liquidity is spent by the last of them. Fills above
+the quote settle only by selling the residual into a pool with nothing left in it — at a price no
+maker would sign for. Refusing to quote them is the answer rather than a shortfall, and the evidence
+is that **widening the budget from 10bp to 5% does not move the number by a wei**: what binds is the
+book, not the budget. The bound stopped being purely a slippage limit and became a slippage limit
+*and* a solvency limit on the venue, which is what it should have been all along.
+
+**A judgement inside the walk.** Crossing a tick that takes active liquidity to exactly zero is
+ordinary — a gap between two liquidity ranges — and the walk carries on across it, because
+`computeSwapStep` at `L = 0` consumes nothing and moves the price straight to the next boundary,
+which is what a pool does. Only a *negative* result is treated as a malformed book. Refusing at zero
+was the first implementation and it was wrong: it would truncate every quote on a venue whose
+liquidity is not contiguous, which is most of them. (On the pools here it happened to change
+nothing, which is exactly why it needed a unit test rather than a fork measurement.)
+
+**One deliberate inaccuracy, in the safe direction.** Finding A's burn is subtracted from the
+starting active liquidity and never added back, so once the walk crosses the parked position's own
+boundary tick the burn is counted twice — once there and once in that tick's `liquidityNet`. Modelling
+it exactly would mean editing the book to reflect a burn that has not happened. It understates the
+book past the boundary, and understating is the direction a bound may err in.
+
+**Cost.** ~3.3KB of runtime per adapter (v3 11,541 → 14,881 B), all of it in a `view` that runs over
+`eth_call`. `onBuy` is untouched: model in the view, execute in the callback.
+
+**One test claim had to be narrowed rather than re-pinned.** The v4 active-share test asserted that
+the gap between a same-venue and a distinct-venue quote *is* the cap, to 1%. Under a single step at
+constant `L` both quotes were linear in the burn and the ratio was exactly the cap; the walk prices
+two different books across two different sets of crossed ticks, and those do not cancel. It is now
+3% and the claim is that the cap explains the gap, not that it accounts for the last basis point.
+Worth flagging as a general shape: an exact identity that held because two things were both linear
+stops holding the moment either becomes real, and the honest move is to widen the tolerance and say
+why rather than to hunt for a number that makes 1% pass again.

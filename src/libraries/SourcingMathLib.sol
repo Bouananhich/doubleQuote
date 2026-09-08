@@ -4,6 +4,7 @@ pragma solidity 0.8.34;
 import {FixedPoint96} from "v4-core/libraries/FixedPoint96.sol";
 import {FullMath} from "v4-core/libraries/FullMath.sol";
 import {SqrtPriceMath} from "v4-core/libraries/SqrtPriceMath.sol";
+import {SwapMath} from "v4-core/libraries/SwapMath.sol";
 
 /// @title SourcingMathLib
 /// @notice Venue-agnostic math behind `buyerAssetsBound`.
@@ -20,10 +21,14 @@ import {SqrtPriceMath} from "v4-core/libraries/SqrtPriceMath.sol";
 ///   no swap fee. Knowingly an over-estimate, kept because it is what the impact is *measured
 ///   against*: D4 put the gap at 0.63bp on the stable venue.
 ///
-///   `boundBySlippage` — the single-step version, D5. It simulates the residual swap against the
-///   route venue's active liquidity and bisects on how much liquidity to burn, subject to a
-///   slippage budget. Exact while the swap stays inside the active tick range, which on a stable
-///   pair a small residual does; D6's multi-tick walk removes that qualifier.
+///   `boundBySlippage` — the real one. It simulates the residual swap against the route venue's
+///   book and bisects on how much liquidity to burn, subject to a slippage budget. D5 modelled the
+///   swap as a single step at constant `L`, which is exact while it stays inside the active tick
+///   range and **fails open** — measured at +25.33% — when it does not. D6 walks the initialized
+///   ticks instead, so the qualifier is gone: `multiStepOut` either models the swap against the
+///   liquidity that is actually there or reports that it could not, and an unmodelled swap is not
+///   quotable. `singleStepOut` survives as the degenerate case and as what the walk is checked
+///   against where the two must agree.
 ///
 /// @dev Both findings from `bound.py` are implemented here rather than approximated (see
 /// `JOURNAL.md`, "Two findings"):
@@ -188,7 +193,38 @@ library SourcingMathLib {
         return ceiling < available ? ceiling : available;
     }
 
-    /// SINGLE-STEP BOUND (D5) ///
+    /// THE BOUND ///
+
+    /// @notice One initialized tick of a route venue's book, as the walk needs it.
+    ///
+    /// @dev A venue-agnostic slice of what both v3 and v4 store per tick. `TickBookLib` reads these
+    /// once, ordered outward from spot in the direction the residual will be sold; `multiStepOut`
+    /// consumes them in order and never has to know where they came from.
+    struct TickStep {
+        /// @dev The boundary's price. Crossing it changes active liquidity.
+        uint160 sqrtPriceX96;
+        /// @dev Signed change to active liquidity on crossing, **already flipped for the direction
+        /// of travel** — the pool's `liquidityNet` negated for a `zeroForOne` walk. Pre-flipping it
+        /// keeps the walk itself direction-free.
+        int128 liquidityNet;
+    }
+
+    /// @notice One residual swap, as `multiStepOut` needs it.
+    ///
+    /// @dev `activeLiquidity` is the venue's liquidity at the current tick **already net of the
+    /// burn** — finding A, which `singleStepOut` takes as a separate argument and this does not.
+    /// Netting it at the call site makes the double-count explicit: the burn is never added back,
+    /// so once the walk crosses the parked position's own boundary tick it is subtracted twice,
+    /// here and again in that tick's `liquidityNet`. Deliberate — it understates the book past the
+    /// boundary, and understating is the direction a bound may err in.
+    struct RouteSwap {
+        uint160 sqrtPriceX96;
+        uint128 activeLiquidity;
+        uint24 feePips;
+        bool zeroForOne;
+        uint256 amountIn;
+        TickStep[] book;
+    }
 
     /// @notice Everything `boundBySlippage` needs about the two venues, in one struct.
     ///
@@ -209,6 +245,11 @@ library SourcingMathLib {
         uint160 routeSqrtPriceX96;
         uint128 routeLiquidity;
         uint24 routeFeePips;
+        /// @dev The route venue's initialized ticks outward from spot, in the direction the
+        /// residual travels. Empty means *no book was read*, not *the book is empty*: the model
+        /// then falls back to the single step, which assumes `routeLiquidity` continues forever and
+        /// therefore over-promises off-range. Every adapter passes one; see `TickBookLib`.
+        TickStep[] routeBook;
         /// @dev Whether the residual is the *route* pool's token0. Sorting can differ between the
         /// two venues, so this is not derivable from `loanIsToken0`.
         bool residualIsRouteToken0;
@@ -258,6 +299,84 @@ library SourcingMathLib {
             : SqrtPriceMath.getAmount0Delta(sqrtPriceAfterX96, sqrtPriceX96, active, false);
     }
 
+    /// @notice Output of an exact-input swap walked across the venue's initialized ticks.
+    ///
+    /// @dev What `singleStepOut` should have been, and the reason D6 exists. The single step
+    /// assumes the active `L` continues in the direction of travel forever; a concentrated pool's
+    /// does not, and where it stops the model quotes liquidity that is not there. Measured on
+    /// Base's USDC/USDT 0.05% pool that was **+25.33%** — a bound failing open, which is the one
+    /// failure mode this design cannot carry, because the taker pays for the revert.
+    ///
+    /// @dev The walk is the pool's own swap loop with the state writes removed:
+    /// `SwapMath.computeSwapStep` to the next boundary, cross, apply the tick's liquidity delta,
+    /// repeat. Using the pool's function rather than a re-derivation is deliberate — the fee is
+    /// then charged per step exactly as the venue charges it, including the rounding.
+    ///
+    /// @dev **Running out of book is not an error, and is never extrapolated over.** `book` is a
+    /// finite snapshot (`TickBookLib.MAX_STEPS`), and a swap large enough to walk off the end is
+    /// simply one this model cannot price: `complete` comes back false and `sourcedFor` refuses to
+    /// quote it. That is the whole fix — the failure mode being replaced is precisely a model that
+    /// assumed what it could not see.
+    ///
+    /// @param swap The venue, the direction, the input and the book. A struct rather than six
+    /// arguments because six plus `computeSwapStep`'s four-value result does not fit the stack this
+    /// project's codegen has — `--via-ir` would also fix it, at the cost of a second compiler
+    /// configuration this repo has stayed free of.
+    /// @return amountOut Tokens received, net of the venue's fee, rounded down.
+    /// @return sqrtPriceAfterX96 Where the walk left the price.
+    /// @return complete Whether the whole input was actually swapped against liquidity the book
+    /// accounted for. False means the answer is a floor, not a quote.
+    function multiStepOut(RouteSwap memory swap)
+        internal
+        pure
+        returns (uint256 amountOut, uint160 sqrtPriceAfterX96, bool complete)
+    {
+        sqrtPriceAfterX96 = swap.sqrtPriceX96;
+        if (swap.amountIn == 0) return (0, sqrtPriceAfterX96, true);
+        if (swap.activeLiquidity == 0 || swap.sqrtPriceX96 == 0) return (0, sqrtPriceAfterX96, false);
+
+        // `computeSwapStep` reads a negative remainder as exact-input, and pays the fee out of it.
+        int256 remaining = -int256(swap.amountIn);
+
+        for (uint256 i; i < swap.book.length; ++i) {
+            uint160 target = swap.book[i].sqrtPriceX96;
+
+            // A book pointing the wrong way would make `computeSwapStep` infer the opposite
+            // direction and answer confidently. Refuse it instead.
+            if (swap.zeroForOne ? target >= sqrtPriceAfterX96 : target <= sqrtPriceAfterX96) {
+                return (amountOut, sqrtPriceAfterX96, false);
+            }
+
+            {
+                (uint160 next, uint256 stepIn, uint256 stepOut, uint256 fee) =
+                    SwapMath.computeSwapStep(sqrtPriceAfterX96, target, swap.activeLiquidity, remaining, swap.feePips);
+
+                amountOut += stepOut;
+                remaining += int256(stepIn + fee);
+                sqrtPriceAfterX96 = next;
+            }
+
+            // Short of the boundary means the input ran out first, which is the answer.
+            if (sqrtPriceAfterX96 != target) return (amountOut, sqrtPriceAfterX96, true);
+
+            int256 crossed = int256(uint256(swap.activeLiquidity)) + swap.book[i].liquidityNet;
+
+            // Negative is not a state a pool can be in, so a book that produces one is malformed
+            // rather than exhausted. Zero, on the other hand, is ordinary: a gap between two
+            // liquidity ranges. `computeSwapStep` at `L = 0` consumes nothing and moves the price
+            // straight to the next boundary, which is exactly what a pool does, so the walk carries
+            // on across the gap rather than giving up in the middle of the book.
+            if (crossed < 0) return (amountOut, sqrtPriceAfterX96, false);
+
+            swap.activeLiquidity = uint128(uint256(crossed));
+
+            if (remaining == 0) return (amountOut, sqrtPriceAfterX96, true);
+        }
+
+        // Walked the whole book with input left over.
+        return (amountOut, sqrtPriceAfterX96, remaining == 0);
+    }
+
     /// @notice What burning `dL` of the parked position actually sources, and what that costs.
     ///
     /// @dev The whole unwind, modelled: burn `dL`, keep the loan-token side, sell the residual side
@@ -269,6 +388,11 @@ library SourcingMathLib {
     /// price question rather than a swap question and belongs to `PRICE_REF` at D8. Note that this
     /// choice moves where the budget bites, never what `sourced` is worth: `sourced` is the
     /// simulated output either way.
+    ///
+    /// @dev D6: the residual swap is now walked across the route venue's book, and a swap the book
+    /// cannot account for is not quotable at all — `_routeOut` returns zero and this returns
+    /// nothing. That is what makes the bisection shrink `dL` until the residual fits inside
+    /// liquidity that was actually read, rather than inside liquidity that was assumed.
     ///
     /// @return sourced Loan token obtained: the direct side plus the residual's swap proceeds.
     /// @return cost What the residual lost on the way through the route venue, in loan token.
@@ -285,14 +409,8 @@ library SourcingMathLib {
         // can honour. Below the model's resolution is not quotable.
         if (residual == 0) return _isInRange(p) ? (0, 0) : (direct, 0);
 
-        (uint256 got,) = singleStepOut(
-            p.routeSqrtPriceX96,
-            p.routeLiquidity,
-            p.routeFeePips,
-            p.residualIsRouteToken0,
-            residual,
-            _selfThinning(p, dL)
-        );
+        (uint256 got, bool priceable) = _routeOut(p, residual, dL);
+        if (!priceable) return (0, 0);
 
         uint256 atSpot = p.residualIsRouteToken0
             ? quote0For1(residual, p.routeSqrtPriceX96)
@@ -377,6 +495,50 @@ library SourcingMathLib {
     /// liquidity here, and a disagreement at the edge would be a silent wrong answer either way.
     function _isInRange(BoundParams memory p) private pure returns (bool) {
         return p.sqrtPriceX96 > p.sqrtLowerX96 && p.sqrtPriceX96 < p.sqrtUpperX96;
+    }
+
+    /// @dev Proceeds of selling `residual` on the route venue, and whether the model could price
+    /// the swap at all. An incomplete walk is unpriceable rather than worth its partial output:
+    /// a partial fill is not what the callback would execute — it would send the whole residual
+    /// through and take whatever the book really held, which is the number this model just failed
+    /// to produce.
+    ///
+    /// @dev An empty `routeBook` is the D5 fallback: no book was read, so the single step assumes
+    /// `routeLiquidity` continues. It is kept because it is the degenerate case the walk must agree
+    /// with in range, and because it is what every library test written before D6 exercises. No
+    /// adapter takes this path.
+    function _routeOut(BoundParams memory p, uint256 residual, uint128 dL)
+        private
+        pure
+        returns (uint256 got, bool priceable)
+    {
+        if (p.routeBook.length == 0) {
+            (uint256 single,) = singleStepOut(
+                p.routeSqrtPriceX96,
+                p.routeLiquidity,
+                p.routeFeePips,
+                p.residualIsRouteToken0,
+                residual,
+                _selfThinning(p, dL)
+            );
+            return (single, true);
+        }
+
+        uint128 burnt = _selfThinning(p, dL);
+        uint128 active = p.routeLiquidity > burnt ? p.routeLiquidity - burnt : 0;
+
+        (uint256 walked,, bool complete) = multiStepOut(
+            RouteSwap({
+                sqrtPriceX96: p.routeSqrtPriceX96,
+                activeLiquidity: active,
+                feePips: p.routeFeePips,
+                zeroForOne: p.residualIsRouteToken0,
+                amountIn: residual,
+                book: p.routeBook
+            })
+        );
+
+        return (walked, complete);
     }
 
     /// @dev How much of a `dL` burn comes out of the route venue's active liquidity.

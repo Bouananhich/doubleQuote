@@ -16,6 +16,7 @@ import {
 } from "./interfaces/IUniswapV3.sol";
 import {IUniswapV3BuyCallback} from "./interfaces/IUniswapV3BuyCallback.sol";
 import {SourcingMathLib} from "./libraries/SourcingMathLib.sol";
+import {TickBookLib} from "./libraries/TickBookLib.sol";
 
 /// @title UniswapV3BuyCallback
 /// @notice Parks a Midnight maker's capital in a Uniswap **v3** position and unwinds it to settle.
@@ -265,7 +266,8 @@ contract UniswapV3BuyCallback is UniswapBuyCallbackBase, IUniswapV3BuyCallback, 
 
         address pool = IUniswapV3Factory(FACTORY).getPool(position.token0, position.token1, position.fee);
         (uint160 sqrtPriceX96,,,,,,) = IUniswapV3Pool(pool).slot0();
-        (uint160 routeSqrtPriceX96,,,,,,) = IUniswapV3Pool(ROUTE_POOL).slot0();
+        (uint160 routeSqrtPriceX96, int24 routeTick,,,,,) = IUniswapV3Pool(ROUTE_POOL).slot0();
+        bool residualIsRouteToken0 = residualToken == ROUTE_TOKEN0;
 
         uint256 bound = SourcingMathLib.boundBySlippage(
             SourcingMathLib.BoundParams({
@@ -277,7 +279,14 @@ contract UniswapV3BuyCallback is UniswapBuyCallbackBase, IUniswapV3BuyCallback, 
                 routeSqrtPriceX96: routeSqrtPriceX96,
                 routeLiquidity: IUniswapV3Pool(ROUTE_POOL).liquidity(),
                 routeFeePips: ROUTE_FEE,
-                residualIsRouteToken0: residualToken == ROUTE_TOKEN0,
+                routeBook: TickBookLib.readBook(
+                    routeTick,
+                    IUniswapV3Pool(ROUTE_POOL).tickSpacing(),
+                    residualIsRouteToken0,
+                    _routeBitmapWord,
+                    _routeLiquidityNet
+                ),
+                residualIsRouteToken0: residualIsRouteToken0,
                 routeIsParkVenue: pool == ROUTE_POOL,
                 maxSlippageWad: MAX_SLIPPAGE_WAD
             })
@@ -304,6 +313,16 @@ contract UniswapV3BuyCallback is UniswapBuyCallbackBase, IUniswapV3BuyCallback, 
             position.owed0,
             position.owed1
         ) = INonfungiblePositionManager(POSITION_MANAGER).positions(tokenId);
+    }
+
+    /// @dev The two venue-specific reads `TickBookLib` walks the route venue with. Passed as
+    /// function pointers so the walk itself is written once and shared with v4.
+    function _routeBitmapWord(int16 wordPosition) private view returns (uint256) {
+        return IUniswapV3Pool(ROUTE_POOL).tickBitmap(wordPosition);
+    }
+
+    function _routeLiquidityNet(int24 tick) private view returns (int128 liquidityNet) {
+        (, liquidityNet,,,,,,) = IUniswapV3Pool(ROUTE_POOL).ticks(tick);
     }
 
     function _residualToken(address loanToken, PositionState memory position) internal pure returns (address) {

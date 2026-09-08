@@ -121,3 +121,31 @@ part that makes the feedback actionable and the part that is impossible to recon
     rather than a language limit. Trivial to work around, but it is the kind of thing that reads
     as "I have the wrong import" for a minute before it reads as "the operator is missing".
     (cost: ~3m)
+
+2026-09-08 15:10  [v4-core]  the tick-bitmap search is unusable from outside the pool.
+    Expected to reuse `TickBitmap.nextInitializedTickWithinOneWord` for the multi-tick walk. Its
+    first parameter is `mapping(int16 => uint256) storage self`, i.e. the pool's own storage, so it
+    is callable only from inside a pool. Every integrator quoting a swap off-chain is reading the
+    bitmap through `tickBitmap(wordPos)` (v3) or `StateLibrary.getTickBitmap` (v4) and therefore has
+    a word *by value* — the one form the library does not accept. Re-implemented the ~20 lines of
+    mask-and-`BitMath` arithmetic against a `uint256` argument.
+    The split is one line of work: a `pure` overload taking `uint256 word` with the storage version
+    calling it. As it stands the exact search a quoter must match bit-for-bit is the piece it is
+    forced to copy by hand, and the two formulations differ between v3 (`(1 << bitPos) - 1 + (1 <<
+    bitPos)`) and v4 (`word << (255 - bitPos)`), so "copy the one from the repo" is already
+    ambiguous. Note this is precisely the case the official quoter contracts sidestep by simulating
+    a real swap and reverting -- which is not available to a `view` that has to bisect.
+    (cost: ~20m)
+
+2026-09-08 15:35  [v4-core]  `computeSwapStep`'s four return values do not fit a swap loop.
+    Expected to call `SwapMath.computeSwapStep` in a loop the way `Pool.swap` does. Stack too deep,
+    at 0.8.34 without `--via-ir`: six arguments plus a four-value destructuring inside a `for` is
+    over the limit. v4-core's own `Pool.sol` does not hit this because it holds the same state in a
+    `SwapResult`/`StepComputations` struct, which reads as house style until you need the function
+    on its own. Ended up doing the same thing — a `RouteSwap` memory struct — after trying block
+    scoping and dropping a parameter first.
+    Fixable in the library rather than in every caller: the four values are always consumed
+    together, so returning a struct would make the function composable instead of leaving each
+    integrator to rediscover the workaround. Turning on `--via-ir` is the other answer and costs a
+    second compiler configuration this project has deliberately stayed free of.
+    (cost: ~15m)

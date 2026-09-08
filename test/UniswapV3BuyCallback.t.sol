@@ -356,8 +356,12 @@ contract UniswapV3BuyCallbackTest is ParkedPositionBase {
     ///
     /// @dev Two callbacks, identical but for the route pool, quoting the same position at the same
     /// budget. Routing through the 0.05% pool — same pair, ~50x thinner, five times the fee — costs
-    /// the maker **16.706342 USDC** of quotable size. The adapter is reading the venue the residual
-    /// will actually be sold on, not the one it came out of.
+    /// the maker **10,032.604159 USDC** of quotable size. The adapter is reading the venue the
+    /// residual will actually be sold on, not the one it came out of.
+    ///
+    /// @dev The gap was 16.706342 before D6, which is the measure of how badly the single step
+    /// misread the thin venue: it priced a residual against liquidity that stops a few ticks up, so
+    /// the two venues looked all but interchangeable. They are not.
     function test_theBoundReadsTheRouteVenueRatherThanTheParkedOne() public {
         uint256 boundHere = _routedCallback(0.001e18, POOL_USDC_USDT_100, 20)
             .buyerAssetsBound(bytes32(0), market, maker, _callbackData());
@@ -365,44 +369,53 @@ contract UniswapV3BuyCallbackTest is ParkedPositionBase {
             .buyerAssetsBound(bytes32(0), market, maker, _callbackData());
 
         assertLt(boundThere, boundHere, "a thinner, dearer route venue did not cost the maker size");
-        assertEq(boundHere - boundThere, 16_706342, "the gap between the two venues moved");
+        assertEq(boundHere - boundThere, 10_032_604159, "the gap between the two venues moved");
     }
 
-    /// @dev **Where the single step stops being exact, measured.** The library's docstring says the
-    /// bound is exact while the residual swap stays inside the route venue's active tick range and
-    /// over-estimates when it does not. Routing through the 0.05% pool is a config where it does
-    /// not: ~9,930 USDT into 7.57e12 of liquidity moves the price about 13bp, past initialized
-    /// ticks, and beyond them the book is thinner than a single step assumes.
+    /// @dev **The D6 deliverable, on the config that made the case for it.** Routing this position
+    /// through the 0.05% pool sends ~9,930 USDT into 7.57e12 of active liquidity, which does not
+    /// stay inside one tick range: the pool's whole book above spot is *eight* initialized ticks
+    /// and its liquidity is spent by the last of them.
     ///
-    /// @dev The result is a **25.33% over-promise** — 19,854.752510 quoted against 14,824.408869
-    /// the position can really source. That is the *dangerous* direction: the bound fails open, and
-    /// a taker who believes it gets a reverted transaction. Compare the same position routed through
-    /// its own pool, where the swap stays in range and the quote is exact to the wei
-    /// (`MidnightIntegration.test_theBoundIsExactlyWhatSettles`).
+    /// @dev The single step assumed that liquidity continued and quoted **19,854.752510**, which
+    /// reverted — a bound failing open, the one failure mode this design cannot carry, because the
+    /// taker pays for the revert. The walk quotes **9,838.854693**, and it settles.
     ///
-    /// @dev This is D6's case, and it is worth noting that it did **not** need the volatile venue
-    /// `PLAN.md` expected it to need — a thinner pool on the same stable pair is enough. Pinned
-    /// rather than fixed: the tick walk is a day's work, and until it lands this is the shape and
-    /// size of the error a maker takes on by routing somewhere thin.
-    function test_theSingleStepOverPromisesOnARouteVenueItsSwapWalksOutOf() public {
+    /// @dev The remaining gap to 14,824.408869 — the largest fill that will technically go through
+    /// — is not headroom the model is leaving on the table. Past the book's last tick the pool has
+    /// nothing left to sell into, so those extra fills settle only by dumping the residual at a
+    /// price the maker would never sign for. Refusing to quote them is the answer, not a shortfall:
+    /// widening the budget from 10bp to 5% does not move this number by a wei, because what binds
+    /// is the book rather than the budget.
+    function test_theWalkedBoundQuotesOnlyWhatTheRouteBookCanAbsorb() public {
         UniswapV3BuyCallback elsewhere = _routedCallback(0.001e18, POOL_USDC_USDT_500, 25);
         uint256 bound = elsewhere.buyerAssetsBound(bytes32(0), market, maker, _callbackData());
 
-        assertEq(bound, 19_854_752510, "the quoted bound moved");
+        assertEq(bound, 9_838_854693, "the quoted bound moved");
 
-        // The quote itself does not settle.
+        // What the single step used to quote here, and what it did when asked to honour it.
         _approve(elsewhere);
         vm.expectRevert(IUniswapV3BuyCallback.InsufficientSourced.selector);
         vm.prank(MIDNIGHT);
-        elsewhere.onBuy(bytes32(0), market, bound, 0, 0, maker, _callbackData());
+        elsewhere.onBuy(bytes32(0), market, 19_854_752510, 0, 0, maker, _callbackData());
 
-        // What does settle is a quarter less. Both sides pinned, so a change in either direction —
-        // the model improving or the error growing — shows up here rather than passing quietly.
+        // The walked quote settles. Pinned in both directions: this is the assertion that fails if
+        // the walk ever drifts back towards optimism.
         _approve(elsewhere);
         vm.prank(MIDNIGHT);
-        elsewhere.onBuy(bytes32(0), market, 14_824_408869, 0, 0, maker, _callbackData());
+        elsewhere.onBuy(bytes32(0), market, bound, 0, 0, maker, _callbackData());
+    }
 
-        assertEq((bound - 14_824_408869) * 10_000 / bound, 2533, "the over-promise changed size");
+    /// @dev The other half of the same claim: the walk did not buy its honesty by being timid
+    /// everywhere. On the deep venue, where the single step was already exact, the answer is
+    /// unchanged to the wei — `MidnightIntegration` pins it against a real `take()`.
+    function test_theWalkDoesNotCostAnythingOnAVenueTheSwapStaysInside() public {
+        assertEq(
+            _routedCallback(0.001e18, POOL_USDC_USDT_100, 26)
+                .buyerAssetsBound(bytes32(0), market, maker, _callbackData()),
+            19_871_458852,
+            "the walk moved the answer on a venue the residual never leaves"
+        );
     }
 
     /// @dev The regression test for a real bug, found only once the bound was asked of a callback

@@ -32,6 +32,24 @@ interface IUniswapV3Pool {
     function fee() external view returns (uint24);
     function tickSpacing() external view returns (int24);
 
+    /// @dev The two reads the multi-tick walk needs. `ticks` returns eight fields; only
+    /// `liquidityNet` is used, and it carries the pool's own sign convention — positive when
+    /// crossing the tick from below adds liquidity.
+    function tickBitmap(int16 wordPosition) external view returns (uint256);
+    function ticks(int24 tick)
+        external
+        view
+        returns (
+            uint128 liquidityGross,
+            int128 liquidityNet,
+            uint256 feeGrowthOutside0X128,
+            uint256 feeGrowthOutside1X128,
+            int56 tickCumulativeOutside,
+            uint160 secondsPerLiquidityOutsideX128,
+            uint32 secondsOutside,
+            bool initialized
+        );
+
     /// @dev The v3 price reference this project relies on. v4 has no equivalent in core.
     function observe(uint32[] calldata secondsAgos)
         external
