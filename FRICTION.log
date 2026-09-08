@@ -149,3 +149,19 @@ part that makes the feedback actionable and the part that is impossible to recon
     integrator to rediscover the workaround. Turning on `--via-ir` is the other answer and costs a
     second compiler configuration this project has deliberately stayed free of.
     (cost: ~15m)
+
+2026-09-08 16:20  [tooling]  quoting by tick walk multiplies archive reads, and CI noticed first.
+    Expected the multi-tick walk to be free in a `view` -- it runs over `eth_call`, so gas is not
+    the constraint. It is not free against a *forked* node: each bound now touches up to 128 bitmap
+    words plus one `ticks()` per initialized tick, all distinct cold storage slots, where the
+    single step touched `slot0` and `liquidity`. Two concurrent CI jobs on the same commit (the
+    `push` and `pull_request` triggers both firing for a branch with an open PR) put that over the
+    public Base endpoint's rate limit: HTTP 429 mid-suite, ten tests failing with `EVM error;
+    database error: failed to get storage`, while the identical concurrent job passed.
+    Two things worth carrying into FEEDBACK.md. The failure does not name a rate limit anywhere
+    near the top -- it surfaces as a storage read failing on a pool address, which reads as a
+    contract bug for a minute. And the general point for anyone quoting Uniswap off-chain: the
+    honest bound is the one that reads the book, and reading the book is what makes a quoter
+    RPC-expensive rather than gas-expensive. An official `view` quoter that walks ticks without
+    simulating-and-reverting would be the thing that makes this cheap for everyone.
+    (cost: ~10m, all of it diagnosis)
