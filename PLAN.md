@@ -136,7 +136,7 @@ real adapter. Closing that found both of the following. **155/155.**
 
 `SourcingMathLib.multiStepOut` walks the route venue's initialized ticks with
 `SwapMath.computeSwapStep`; `TickBookLib` reads the book once, in the direction the residual travels,
-and hands it over as a flat array. Live on all three adapters. **173/173.**
+and hands it over as a flat array. Live on all three adapters. **175/175.**
 
 - **The fail-open case is closed.** Same position, same 10bp budget, routed through the thin 0.05%
   pool: the single step quoted **19,854.752510** and that reverted; the walk quotes
@@ -158,7 +158,10 @@ close — `readBook` returns an empty array for a venue too sparse to read, and 
 assumed liquidity continued forever, which is the pre-D6 model on exactly the venues D6 exists for.
 Removed: unreadable is unquotable. The bitmap search also gained the direct unit tests it should
 have had — it is arithmetic copied by hand from a library that cannot be called from outside a
-pool, and it was only being checked several layers downstream by a fork test.
+pool, and it was only being checked several layers downstream by a fork test. A second round found
+that **deleting the walk outright left all 38 v4 tests green**: v4's quotes were asserted as ranges,
+so the crossing they do exercise was never pinned. Now exact — 214.661289 against the single step's
+245.214731, a 14.23% gap that on v4 is a budget breach rather than a revert.
 
 **Next:** D7 — the griefing test on v3. Note that D6 changed what it is testing against: the bound
 now refuses to quote a fill the route venue cannot absorb, so an attacker who moves the pool is

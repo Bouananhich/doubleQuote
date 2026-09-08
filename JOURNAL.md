@@ -972,3 +972,45 @@ before its output means anything.
 the production path with it. It stays in the library as an *independent* formula: the walk must
 reproduce it to the wei for a swap that crosses nothing, which is the only test that would catch the
 two disagreeing about the fee or the rounding.
+
+## 2026-09-08 — D6 review, second round: v4 exercised the walk without testing it
+
+Two more coverage comments, both correct, and the second one is the more interesting.
+
+**"No v4 fork test drives `buyerAssetsBound` through a route pool where the walk actually crosses an
+initialized tick."** The premise turned out to be half wrong in a way that made the finding worse
+rather than better. v4 *does* cross — the parked pool's first initialized tick sits one tick from
+spot, so a residual of any size leaves the active range immediately. What was missing was any
+assertion that would notice.
+
+Measured rather than argued: replacing `multiStepOut` with `singleStepOut` — deleting D6 outright —
+left **all 38 v4 tests green**, while v3 caught it with four failures. The v4 quotes were all
+asserted as ranges (`100e6 < bound < 500e6`) or as relative orderings, and both survive a 14%
+change in the number. Coverage that executes a code path without constraining it is not coverage,
+and the two are indistinguishable from a passing suite.
+
+Now pinned exactly in both v4 suites: **214.661289** walked against **245.214731** single-stepped.
+
+**The v4 failure is not v3's failure, and saying so precisely matters.** On v3 the single step's
+extra size does not settle — it is a bound failing open and the taker eats the revert. On v4 both
+numbers settle, because there the bound is budget-limited with capacity far above it. What the
+single step buys is 30.55 USDC of quoted size sourced by spending more than the 1bp the maker
+signed for. Same mispricing, same cause, different victim: the taker on v3, the maker on v4. I
+nearly wrote this up as another fail-open and checked first.
+
+**"No test combines `routeIsParkVenue=true` with a book that actually gets crossed."** Correct, and
+it was the one interaction D6 introduced without covering. Every test setting that flag used the
+deep default book, so finding A's burn was subtracted from a book the swap never walked — the two
+mechanisms were each tested alone and never together.
+
+Two tests now. The first is that they compound, with the active-share cap asserted *not* to bind so
+the measurement is self-thinning plus the walk rather than finding B. The second makes the
+double-count a number: `multiStepOut` takes liquidity already net of the burn and never adds it
+back, so reaching the parked position's own boundary subtracts the burn a second time inside a
+`liquidityNet` that still describes the position at full size. The library claimed this was
+deliberate and erred downward; that claim now has a test comparing the book as read against the book
+a position-aware model would walk, and asserting the difference is real and negative.
+
+**175/175.** Mutation-checked again, since the whole finding was that a green suite proved nothing:
+deleting the walk now fails 4 v4 tests and 8 library tests; deleting self-thinning fails 6 and 2.
+Both were zero and zero on one side before this round.

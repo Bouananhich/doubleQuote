@@ -654,4 +654,62 @@ contract SourcingMathLibTest is Test {
         assertGt(walked, 0, "the fill that fits under the cliff is still quotable");
         assertLt(walked, assumed / 5, "the cliff did not cut the quote");
     }
+
+    /// SELF-THINNING MEETS THE WALK ///
+
+    /// @dev **Finding A and D6 in the same call, which nothing else covered.** Self-thinning only
+    /// applies when the route venue *is* the parked venue, and every test that set that flag until
+    /// now used the deep default book, so the burn was subtracted from a book the swap never
+    /// walked. The two compound: the burn thins the liquidity the residual starts against, and the
+    /// walk then charges for crossing out of what is left.
+    function test_selfThinningAndTheWalkCompound() public pure {
+        SourcingMathLib.TickStep[] memory book = _book(0, 1, 20, -1e18);
+
+        uint256 sameVenue = SourcingMathLib.boundBySlippage(_withBook(_params(1e19, true, 0.001e18), book));
+        uint256 elsewhere = SourcingMathLib.boundBySlippage(_withBook(_params(1e19, false, 0.001e18), book));
+
+        assertGt(elsewhere, 0, "the control quoted nothing, so the comparison is empty");
+        assertLt(sameVenue, elsewhere, "burning into the book being walked cost nothing");
+
+        // Not the active-share cap doing the work: at this route depth the cap allows 5e18 and the
+        // whole position is 1e18, so it never binds and what is left is finding A plus the walk.
+        assertEq(
+            SourcingMathLib.maxBurnableLiquidity(_params(1e19, true, 0.001e18)),
+            LIQUIDITY,
+            "the cap bound first, so this measures the cap rather than self-thinning"
+        );
+    }
+
+    /// @dev **The documented double-count, made a number.** `multiStepOut` takes active liquidity
+    /// already net of the burn and never adds it back, so when the walk reaches the parked
+    /// position's own boundary tick it subtracts the burn a second time — once at the start and
+    /// once inside that tick's `liquidityNet`, which still describes the position at full size.
+    ///
+    /// @dev The library says this is deliberate and errs downward. Until now that was a claim in a
+    /// comment. Here it is the difference between the book as read and the book a position-aware
+    /// model would use, where the boundary gives back the `dL` that is no longer there.
+    function test_theBurnIsCountedTwiceAtThePositionsOwnBoundaryAndThatUnderStates() public pure {
+        uint128 routeLiquidity = 1e18;
+        uint128 parked = 4e17;
+        uint128 dL = 1e17;
+
+        // The parked position's upper edge: crossing it removes the whole position, at the size the
+        // pool still thinks it is.
+        SourcingMathLib.TickStep[] memory asRead = new SourcingMathLib.TickStep[](2);
+        asRead[0] =
+            SourcingMathLib.TickStep({sqrtPriceX96: TickMath.getSqrtPriceAtTick(10), liquidityNet: -int128(parked)});
+        asRead[1] = SourcingMathLib.TickStep({sqrtPriceX96: TickMath.getSqrtPriceAtTick(500), liquidityNet: -1e15});
+
+        // What a position-aware model would walk: the boundary only removes what is still there.
+        SourcingMathLib.TickStep[] memory corrected = new SourcingMathLib.TickStep[](2);
+        corrected[0] =
+            SourcingMathLib.TickStep({sqrtPriceX96: asRead[0].sqrtPriceX96, liquidityNet: -int128(parked - dL)});
+        corrected[1] = asRead[1];
+
+        (uint256 conservative,, bool completeA) = SourcingMathLib.multiStepOut(_swap(routeLiquidity - dL, 2e15, asRead));
+        (uint256 exact,, bool completeB) = SourcingMathLib.multiStepOut(_swap(routeLiquidity - dL, 2e15, corrected));
+
+        assertTrue(completeA && completeB, "both books should absorb this swap");
+        assertLt(conservative, exact, "the double-count is not actually costing anything, so it is untested");
+    }
 }
