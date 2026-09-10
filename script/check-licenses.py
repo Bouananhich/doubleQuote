@@ -47,7 +47,16 @@ def compiled_sources():
     stale unit from a deleted contract would report imports nothing has any more.
     """
     shutil.rmtree(BUILD_INFO, ignore_errors=True)
-    subprocess.run(["forge", "build", "--build-info"], cwd=ROOT, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    # Captured rather than discarded: `forge build` writes its lint notes to stderr on a *successful*
+    # build, which is noise here, but it writes the compiler errors there too. Suppressing the
+    # stream outright would turn a broken build into a bare traceback with the diagnosis thrown
+    # away — so it is held and only printed when it is the thing you need.
+    build = subprocess.run(["forge", "build", "--build-info"], cwd=ROOT, capture_output=True, text=True)
+    if build.returncode != 0:
+        sys.stderr.write(build.stdout)
+        sys.stderr.write(build.stderr)
+        raise SystemExit(f"forge build failed ({build.returncode}); nothing to inventory")
 
     paths = set()
     for unit in BUILD_INFO.glob("*.json"):
