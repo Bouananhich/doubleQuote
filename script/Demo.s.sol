@@ -113,6 +113,8 @@ contract Demo is Script {
 
         vm.startBroadcast();
 
+        _touchAndAssertMarket();
+
         IERC20(USDC).approve(V3_POSITION_MANAGER, DEMO_USDC);
         IERC20(USDT).approve(V3_POSITION_MANAGER, DEMO_USDT);
 
@@ -188,6 +190,8 @@ contract Demo is Script {
         vm.startBroadcast();
         address taker = msg.sender;
 
+        _touchAndAssertMarket();
+
         IERC20(CBBTC).approve(MIDNIGHT, collateral);
         IMidnight(MIDNIGHT).supplyCollateral(_market(), 0, collateral, taker);
 
@@ -201,12 +205,25 @@ contract Demo is Script {
 
     /// SHARED ///
 
+    /// @dev `touchMarket` is idempotent and costs ~12.8k gas against a market that already exists,
+    /// which is what makes it a cheap assertion rather than a creation. If this ever reverts the
+    /// script is pointed at a market that is not the one pinned above, and nothing else it prints
+    /// can be trusted.
+    function _touchAndAssertMarket() internal {
+        bytes32 id = IMidnight(MIDNIGHT).touchMarket(_market());
+        require(id == MARKET_ID, "market id is not the pinned live market");
+    }
+
     /// @dev The offer. This struct *is* the publication — there is nothing else to post anywhere.
     function _offer(address maker, uint256 maxUnits) internal view returns (Offer memory offer) {
         offer.market = _market();
         offer.buy = true;
         offer.maker = maker;
-        offer.expiry = vm.envOr("DEMO_EXPIRY", block.timestamp + 7 days);
+        // **Required, never defaulted.** A `block.timestamp`-derived expiry differs between the
+        // `digest()` call and the `take()` that follows it, which changes the offer hash and
+        // invalidates the signature — the demo would fail at the last step, live. Set it once and
+        // keep it for every step, exactly as with the market.
+        offer.expiry = vm.envUint("DEMO_EXPIRY");
         offer.tick = MAX_TICK;
         offer.callback = vm.envAddress("DEMO_CALLBACK");
         offer.callbackData = abi.encode(vm.envUint("DEMO_TOKEN_ID"));

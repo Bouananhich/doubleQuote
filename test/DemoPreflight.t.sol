@@ -5,8 +5,8 @@ import {INonfungiblePositionManager, IUniswapV3Pool} from "../src/interfaces/IUn
 import {UniswapV3BuyCallback} from "../src/UniswapV3BuyCallback.sol";
 
 import {Offer, Market, CollateralParams} from "midnight/src/interfaces/IMidnight.sol";
-import {Signature, EIP712_DOMAIN_TYPEHASH} from "midnight/src/ratifiers/interfaces/IEcrecoverRatifier.sol";
-import {HashLib} from "midnight/src/ratifiers/libraries/HashLib.sol";
+import {Signature} from "midnight/src/ratifiers/interfaces/IEcrecoverRatifier.sol";
+import {OfferDigest} from "../script/OfferDigest.sol";
 
 import {MidnightMarketBase} from "./MidnightMarketBase.sol";
 import {IERC20Meta} from "./interfaces/IUniswapMinimal.sol";
@@ -256,15 +256,15 @@ contract DemoPreflightTest is MidnightMarketBase {
     }
 
     /// @dev `abi.encode(Signature, root, leafIndex, proof)`, with the single-offer degenerate tree.
-    function _sign(Offer memory offer, uint256 key) internal view returns (bytes memory) {
-        bytes32 root = HashLib.hashOffer(offer);
-        bytes32[] memory proof = new bytes32[](0);
-
-        bytes32 structHash = keccak256(abi.encode(HashLib.offerTreeTypeHash(proof.length), root));
-        bytes32 domainSeparator = keccak256(abi.encode(EIP712_DOMAIN_TYPEHASH, block.chainid, ECRECOVER_RATIFIER));
-        bytes32 digest = keccak256(bytes.concat("\x19\x01", domainSeparator, structHash));
+    /// @dev Signs through **`OfferDigest`, the contract the demo actually calls**, rather than
+    /// recomputing the digest here. Reimplementing it would leave the deployed helper untested while
+    /// appearing to cover it: this test would still pass with `OfferDigest` completely wrong, which
+    /// is the failure the demo would then hit live.
+    function _sign(Offer memory offer, uint256 key) internal returns (bytes memory) {
+        OfferDigest helper = new OfferDigest(ECRECOVER_RATIFIER);
+        (bytes32 root, bytes32 digest) = helper.rootAndDigest(offer);
 
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(key, digest);
-        return abi.encode(Signature({v: v, r: r, s: s}), root, uint256(0), proof);
+        return abi.encode(Signature({v: v, r: r, s: s}), root, uint256(0), new bytes32[](0));
     }
 }

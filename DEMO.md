@@ -7,8 +7,9 @@ loan settles. What is left keeps earning.
 
 Every step below is a real transaction on Base. **Nothing is mocked.** The loan settles into
 Midnight's live cbBTC/USDC market — 86% LLTV, the deployed `0x663BECd1…` oracle, maturing 25 December
-2026 — and the offer is authorised by Morpho's own `EcrecoverRatifier`. The market id is asserted
-against `0x9593c3a6…` at every step rather than trusted.
+2026 — and the offer is authorised by Morpho's own `EcrecoverRatifier`. Both transaction-sending
+steps assert the market id against `0x9593c3a6…` before doing anything else, via an idempotent
+`touchMarket` that costs ~12.8k gas against a market that already exists.
 
 ## What it costs
 
@@ -63,9 +64,14 @@ and discovery are not prerequisites for settlement."
 export BASE_RPC_URL=...            # or leave unset for the public endpoint
 export DEMO_MAKER=0x...            # holds 10 USDC + 10 USDT + a little ETH
 export DEMO_TAKER=0x...            # holds ~0.0003 cbBTC + a little ETH
+export DEMO_EXPIRY=$(( $(date +%s) + 604800 ))      # 7 days
 ```
 
-The market is pinned in the script, so there is no maturity to keep in sync.
+**Set `DEMO_EXPIRY` once and keep it for every step.** It is part of the offer, so a different value
+is a different offer hash and the signature from step 4 will not verify at step 5. The script refuses
+to default it for exactly that reason — an expiry derived from `block.timestamp` drifts between the
+call that prints the digest and the transaction that uses it, and the demo would fail at the last
+step, live. The market needs no such care: it is pinned in the script.
 
 ## Step 1 — the maker deploys
 
