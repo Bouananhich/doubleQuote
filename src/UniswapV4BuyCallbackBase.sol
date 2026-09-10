@@ -17,6 +17,7 @@ import {UniswapBuyCallbackBase} from "./UniswapBuyCallbackBase.sol";
 import {IPriceRef} from "./interfaces/IPriceRef.sol";
 import {IUniswapV4BuyCallback} from "./interfaces/IUniswapV4BuyCallback.sol";
 import {SourcingMathLib} from "./libraries/SourcingMathLib.sol";
+import {TickBookLib} from "./libraries/TickBookLib.sol";
 
 /// @title UniswapV4BuyCallbackBase
 /// @notice Everything the two v4 adapters share: the route venue, the residual swap, delta
@@ -175,9 +176,10 @@ abstract contract UniswapV4BuyCallbackBase is UniswapBuyCallbackBase, IUniswapV4
         // the honest bound in that case is zero, not the position's paper value.
         if (!(residualCurrency == ROUTE_CURRENCY0) && !(residualCurrency == ROUTE_CURRENCY1)) return 0;
 
-        PoolKey memory route = routeKey();
+        PoolId routeId = routeKey().toId();
         (uint160 sqrtPriceX96,,,) = IPoolManager(POOL_MANAGER).getSlot0(key.toId());
-        (uint160 routeSqrtPriceX96,,,) = IPoolManager(POOL_MANAGER).getSlot0(route.toId());
+        (uint160 routeSqrtPriceX96,,,) = IPoolManager(POOL_MANAGER).getSlot0(routeId);
+        bool residualIsRouteToken0 = residualCurrency == ROUTE_CURRENCY0;
 
         return SourcingMathLib.boundBySlippage(
             SourcingMathLib.BoundParams({
@@ -187,12 +189,29 @@ abstract contract UniswapV4BuyCallbackBase is UniswapBuyCallbackBase, IUniswapV4
                 liquidity: liquidity,
                 loanIsToken0: loanIsCurrency0,
                 routeSqrtPriceX96: routeSqrtPriceX96,
-                routeLiquidity: IPoolManager(POOL_MANAGER).getLiquidity(route.toId()),
+                routeLiquidity: IPoolManager(POOL_MANAGER).getLiquidity(routeId),
                 routeFeePips: ROUTE_FEE,
-                residualIsRouteToken0: residualCurrency == ROUTE_CURRENCY0,
-                routeIsParkVenue: PoolId.unwrap(key.toId()) == PoolId.unwrap(route.toId()),
+                routeBook: _routeBook(residualIsRouteToken0),
+                residualIsRouteToken0: residualIsRouteToken0,
+                routeIsParkVenue: PoolId.unwrap(key.toId()) == PoolId.unwrap(routeId),
                 maxSlippageWad: MAX_SLIPPAGE_WAD
             })
         );
+    }
+
+    /// @dev The route venue's book, outward from spot in the direction the residual travels.
+    function _routeBook(bool zeroForOne) private view returns (SourcingMathLib.TickStep[] memory) {
+        (, int24 tick,,) = IPoolManager(POOL_MANAGER).getSlot0(routeKey().toId());
+        return TickBookLib.readBook(tick, ROUTE_TICK_SPACING, zeroForOne, _routeBitmapWord, _routeLiquidityNet);
+    }
+
+    /// @dev The two venue-specific reads `TickBookLib` walks the route venue with. Passed as
+    /// function pointers so the walk itself is written once and shared with v3.
+    function _routeBitmapWord(int16 wordPosition) private view returns (uint256) {
+        return IPoolManager(POOL_MANAGER).getTickBitmap(routeKey().toId(), wordPosition);
+    }
+
+    function _routeLiquidityNet(int24 tick) private view returns (int128 liquidityNet) {
+        (, liquidityNet) = IPoolManager(POOL_MANAGER).getTickLiquidity(routeKey().toId(), tick);
     }
 }

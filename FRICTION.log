@@ -121,3 +121,47 @@ part that makes the feedback actionable and the part that is impossible to recon
     rather than a language limit. Trivial to work around, but it is the kind of thing that reads
     as "I have the wrong import" for a minute before it reads as "the operator is missing".
     (cost: ~3m)
+
+2026-09-08 15:10  [v4-core]  the tick-bitmap search is unusable from outside the pool.
+    Expected to reuse `TickBitmap.nextInitializedTickWithinOneWord` for the multi-tick walk. Its
+    first parameter is `mapping(int16 => uint256) storage self`, i.e. the pool's own storage, so it
+    is callable only from inside a pool. Every integrator quoting a swap off-chain is reading the
+    bitmap through `tickBitmap(wordPos)` (v3) or `StateLibrary.getTickBitmap` (v4) and therefore has
+    a word *by value* — the one form the library does not accept. Re-implemented the ~20 lines of
+    mask-and-`BitMath` arithmetic against a `uint256` argument.
+    The split is one line of work: a `pure` overload taking `uint256 word` with the storage version
+    calling it. As it stands the exact search a quoter must match bit-for-bit is the piece it is
+    forced to copy by hand, and the two formulations differ between v3 (`(1 << bitPos) - 1 + (1 <<
+    bitPos)`) and v4 (`word << (255 - bitPos)`), so "copy the one from the repo" is already
+    ambiguous. Note this is precisely the case the official quoter contracts sidestep by simulating
+    a real swap and reverting -- which is not available to a `view` that has to bisect.
+    (cost: ~20m)
+
+2026-09-08 15:35  [v4-core]  `computeSwapStep`'s four return values do not fit a swap loop.
+    Expected to call `SwapMath.computeSwapStep` in a loop the way `Pool.swap` does. Stack too deep,
+    at 0.8.34 without `--via-ir`: six arguments plus a four-value destructuring inside a `for` is
+    over the limit. v4-core's own `Pool.sol` does not hit this because it holds the same state in a
+    `SwapResult`/`StepComputations` struct, which reads as house style until you need the function
+    on its own. Ended up doing the same thing — a `RouteSwap` memory struct — after trying block
+    scoping and dropping a parameter first.
+    Fixable in the library rather than in every caller: the four values are always consumed
+    together, so returning a struct would make the function composable instead of leaving each
+    integrator to rediscover the workaround. Turning on `--via-ir` is the other answer and costs a
+    second compiler configuration this project has deliberately stayed free of.
+    (cost: ~15m)
+
+2026-09-08 16:20  [tooling]  quoting by tick walk multiplies archive reads, and CI noticed first.
+    Expected the multi-tick walk to be free in a `view` -- it runs over `eth_call`, so gas is not
+    the constraint. It is not free against a *forked* node: each bound now touches up to 128 bitmap
+    words plus one `ticks()` per initialized tick, all distinct cold storage slots, where the
+    single step touched `slot0` and `liquidity`. Two concurrent CI jobs on the same commit (the
+    `push` and `pull_request` triggers both firing for a branch with an open PR) put that over the
+    public Base endpoint's rate limit: HTTP 429 mid-suite, ten tests failing with `EVM error;
+    database error: failed to get storage`, while the identical concurrent job passed.
+    Two things worth carrying into FEEDBACK.md. The failure does not name a rate limit anywhere
+    near the top -- it surfaces as a storage read failing on a pool address, which reads as a
+    contract bug for a minute. And the general point for anyone quoting Uniswap off-chain: the
+    honest bound is the one that reads the book, and reading the book is what makes a quoter
+    RPC-expensive rather than gas-expensive. An official `view` quoter that walks ticks without
+    simulating-and-reverting would be the thing that makes this cheap for everyone.
+    (cost: ~10m, all of it diagnosis)

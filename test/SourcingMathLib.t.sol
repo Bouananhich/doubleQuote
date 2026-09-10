@@ -208,6 +208,16 @@ contract SourcingMathLibTest is Test {
 
     /// SINGLE-STEP BOUND ///
 
+    /// @dev The book every `_params` case carries unless a test replaces it: four boundaries
+    /// starting 5,000 ticks above spot. No residual any position here can produce reaches the first
+    /// one — the worst case is a full burn against the thinnest route venue these tests use, which
+    /// moves the price ~200 ticks — so the walk provably crosses nothing and reduces to the
+    /// closed-form single step. That is what keeps the D5 numbers below meaningful after D6: they
+    /// are still measuring the same arithmetic, on a venue deep enough that the book never bites.
+    function _deepBook() internal pure returns (SourcingMathLib.TickStep[] memory) {
+        return _book(5000, 1000, 4, -1e15);
+    }
+
     /// @dev A deep venue: the position is a thousandth of the book, so its residual barely moves it.
     function _params(uint128 routeLiquidity, bool routeIsParkVenue, uint256 budgetWad)
         internal
@@ -225,8 +235,22 @@ contract SourcingMathLibTest is Test {
             routeFeePips: FEE_100,
             residualIsRouteToken0: false,
             routeIsParkVenue: routeIsParkVenue,
+            routeBook: _deepBook(),
             maxSlippageWad: budgetWad
         });
+    }
+
+    /// @dev Replaces the deep default with a book that actually bites.
+    ///
+    /// @dev Mutates and returns the same struct: `BoundParams` is a memory reference, so a caller
+    /// wanting both answers has to build the params twice rather than reuse one.
+    function _withBook(SourcingMathLib.BoundParams memory p, SourcingMathLib.TickStep[] memory book)
+        internal
+        pure
+        returns (SourcingMathLib.BoundParams memory)
+    {
+        p.routeBook = book;
+        return p;
     }
 
     /// @dev The step is the exact-input formula and nothing else: no fee, no impact, no venue, just
@@ -354,18 +378,20 @@ contract SourcingMathLibTest is Test {
     /// total loss and only the loan-token side of the burn survives. Under any realistic budget
     /// that whole-residual loss blows through the ratio at every `dL`, and the quote is zero.
     ///
-    /// @dev It is *not* zero under a 100% budget, and that is consistent rather than a gap: a maker
-    /// who authorises losing everything on the swap really can still source the direct side. The
-    /// deployable ceiling on `MAX_SLIPPAGE_WAD` is 10%, so no deployment can ask for that.
-    function test_anEmptyRouteVenueQuotesNothingUnderARealBudget() public pure {
+    /// @dev It is zero at *every* budget, including one no deployment could set — which changed
+    /// with D6 and is worth stating rather than letting the assertion pass quietly. Before the walk
+    /// this quoted the direct side under a 100% budget, on the reasoning that a maker authorising
+    /// the loss of the whole residual can still source the loan-token half. That reasoning still
+    /// holds; what no longer holds is the model's right to assert it, because a venue with no
+    /// active liquidity is one whose book the walk cannot price at all. Under-reporting is the
+    /// direction a bound may err in, and the deployable ceiling on `MAX_SLIPPAGE_WAD` is 10%, so
+    /// nothing reachable is lost.
+    function test_anEmptyRouteVenueQuotesNothingAtAnyBudget() public pure {
         assertEq(SourcingMathLib.boundBySlippage(_params(0, true, 0.0001e18)), 0, "quoted against an empty route venue");
+        assertEq(SourcingMathLib.boundBySlippage(_params(0, true, 1e18)), 0, "an unreadable venue is not quotable");
 
-        (uint256 direct,) = SourcingMathLib.sourcedFor(_params(0, true, 1e18), LIQUIDITY);
-        assertEq(
-            SourcingMathLib.boundBySlippage(_params(0, true, 1e18)),
-            direct,
-            "a 100% budget should still reach the loan-token side"
-        );
+        // Not vacuous: the same position over a venue that *has* a book quotes plenty.
+        assertGt(SourcingMathLib.boundBySlippage(_params(1e24, false, 0.0001e18)), 0, "nothing quotes at all");
     }
 
     /// @dev **The dust floor.** A `dL` too small for the residual to survive rounding used to price
@@ -474,5 +500,216 @@ contract SourcingMathLibTest is Test {
             SourcingMathLib.quote0For1(1e18, SQRT_PRICE_1),
             "token0 should be worth more in token1 as price rises"
         );
+    }
+
+    /// THE MULTI-TICK WALK (D6) ///
+
+    /// @dev A book of `count` boundaries `spacingTicks` apart, each removing `netOut` liquidity on
+    /// the way out — the shape of a concentrated pool's book above spot, expressed in the
+    /// direction-of-travel sign convention `TickBookLib` writes.
+    function _book(int24 from, int24 spacingTicks, uint256 count, int128 netOut)
+        internal
+        pure
+        returns (SourcingMathLib.TickStep[] memory book)
+    {
+        book = new SourcingMathLib.TickStep[](count);
+        for (uint256 i; i < count; ++i) {
+            book[i] = SourcingMathLib.TickStep({
+                sqrtPriceX96: TickMath.getSqrtPriceAtTick(from + spacingTicks * int24(uint24(i + 1))),
+                liquidityNet: netOut
+            });
+        }
+    }
+
+    function _swap(uint128 liquidity, uint256 amountIn, SourcingMathLib.TickStep[] memory book)
+        internal
+        pure
+        returns (SourcingMathLib.RouteSwap memory)
+    {
+        return SourcingMathLib.RouteSwap({
+            sqrtPriceX96: SQRT_PRICE_1,
+            activeLiquidity: liquidity,
+            feePips: FEE_100,
+            zeroForOne: false,
+            amountIn: amountIn,
+            book: book
+        });
+    }
+
+    /// @dev The walk's floor: a swap that never reaches the first boundary crosses nothing, so it
+    /// must be the single step to the wei. If these two ever disagree, one of them is wrong about
+    /// the fee or the rounding, and this is the only test that would say so.
+    function test_aSwapThatCrossesNothingIsExactlyTheSingleStep() public pure {
+        (uint256 single,) = SourcingMathLib.singleStepOut(SQRT_PRICE_1, 1e24, FEE_100, false, 1e18, 0);
+        (uint256 walked, uint160 after_, bool complete) =
+            SourcingMathLib.multiStepOut(_swap(1e24, 1e18, _book(0, 500, 4, -1e23)));
+
+        assertTrue(complete, "a swap well inside the first tick should be priceable");
+        assertEq(walked, single, "the walk and the single step disagree inside one range");
+        assertGt(after_, SQRT_PRICE_1, "a one-for-zero swap should have raised the price");
+    }
+
+    /// @dev **The D6 result, in miniature.** Same swap, same starting liquidity; the only difference
+    /// is that the walk knows the book thins out past the ticks it crosses and the single step does
+    /// not. The single step returns more — that is the over-promise, and it is measured at 25.33%
+    /// through a real adapter in `UniswapV3BuyCallback.t.sol`.
+    function test_theSingleStepOverStatesASwapThatWalksIntoAThinningBook() public pure {
+        SourcingMathLib.TickStep[] memory book = _book(0, 10, 8, -1e17);
+
+        (uint256 single,) = SourcingMathLib.singleStepOut(SQRT_PRICE_1, 1e18, FEE_100, false, 1e15, 0);
+        (uint256 walked,, bool complete) = SourcingMathLib.multiStepOut(_swap(1e18, 1e15, book));
+
+        assertTrue(complete, "the book should absorb this one");
+        assertLt(walked, single, "the walk did not charge for the liquidity it crossed out of");
+    }
+
+    /// @dev The fix itself. Beyond the last boundary the book says nothing, and the model does not
+    /// get to assume. An input the book cannot absorb comes back incomplete, and the partial output
+    /// it did compute is not a quote.
+    function test_aSwapThatWalksOffTheBookIsNotPriceable() public pure {
+        (uint256 walked,, bool complete) = SourcingMathLib.multiStepOut(_swap(1e18, 100e18, _book(0, 10, 2, -4e17)));
+
+        assertFalse(complete, "walking off the end of the book was reported as a completed swap");
+        assertGt(walked, 0, "the partial output is still worth returning, it is just not a quote");
+    }
+
+    /// @dev **The regression test for the review's critical finding.** `boundBySlippage` used to
+    /// fall back to the single step when `routeBook` was empty, on the reasoning that an empty book
+    /// meant *no book was read* and only library tests could produce one. Wrong on the second half:
+    /// `TickBookLib.readBook` returns an empty array whenever it finds no initialized tick, so a
+    /// real adapter over a sparse venue reached it — and it is the pre-D6 model, so it reopened the
+    /// +25.33% fail-open on exactly the venues the walk exists for. The fallback is gone. An empty
+    /// book prices nothing, at the swap and at the bound.
+    ///
+    /// @dev Deliberately asserted at both levels. `multiStepOut` refusing is not enough on its own:
+    /// the bug was one layer up, in what `sourcedFor` did with the refusal.
+    function test_anEmptyBookQuotesNothingRatherThanFallingBackToTheSingleStep() public pure {
+        (,, bool complete) = SourcingMathLib.multiStepOut(_swap(1e18, 1e15, new SourcingMathLib.TickStep[](0)));
+        assertFalse(complete, "an empty book priced a swap it knew nothing about");
+
+        SourcingMathLib.BoundParams memory p = _params(1e24, false, 0.001e18);
+        assertGt(SourcingMathLib.boundBySlippage(p), 0, "the deep-book control quoted nothing");
+
+        assertEq(
+            SourcingMathLib.boundBySlippage(
+                _withBook(_params(1e24, false, 0.001e18), new SourcingMathLib.TickStep[](0))
+            ),
+            0,
+            "an unreadable venue fell back to assuming its liquidity continues"
+        );
+    }
+
+    /// @dev A gap between two liquidity ranges is ordinary, not the end of the book: the pool skips
+    /// across it for free and so does the walk. Refusing here would truncate every quote on a venue
+    /// whose liquidity is not contiguous — which is most of them.
+    function test_theWalkCrossesAZeroLiquidityGap() public pure {
+        SourcingMathLib.TickStep[] memory book = new SourcingMathLib.TickStep[](3);
+        book[0] = SourcingMathLib.TickStep({sqrtPriceX96: TickMath.getSqrtPriceAtTick(10), liquidityNet: -1e18});
+        book[1] = SourcingMathLib.TickStep({sqrtPriceX96: TickMath.getSqrtPriceAtTick(60), liquidityNet: 1e18});
+        book[2] = SourcingMathLib.TickStep({sqrtPriceX96: TickMath.getSqrtPriceAtTick(200), liquidityNet: -1e18});
+
+        (uint256 walked, uint160 after_, bool complete) = SourcingMathLib.multiStepOut(_swap(1e18, 2e15, book));
+
+        assertTrue(complete, "an empty stretch of book ended the walk");
+        assertGt(walked, 0, "the walk returned nothing across the gap");
+        assertGt(after_, TickMath.getSqrtPriceAtTick(60), "the price should have jumped the gap for free");
+    }
+
+    /// @dev A book ordered against the direction of travel would make `computeSwapStep` infer the
+    /// opposite direction and answer with total confidence. Refuse it: this is the one input to the
+    /// walk an adapter could get wrong silently, and a silently wrong bound is the failure mode D6
+    /// exists to remove.
+    function test_aBookPointingTheWrongWayIsRefused() public pure {
+        SourcingMathLib.TickStep[] memory downward = _book(-100, 10, 4, -1e17);
+
+        (,, bool complete) = SourcingMathLib.multiStepOut(_swap(1e18, 1e15, downward));
+
+        assertFalse(complete, "a book on the wrong side of spot was walked anyway");
+    }
+
+    /// @dev The walk, wired through `boundBySlippage`. The same position and budget quote strictly
+    /// less once the model can see that the route venue thins out — and the difference is not a
+    /// tuning choice, it is the part of the D5 answer that was never there to source.
+    function test_theBoundIsSmallerOnceTheBookIsRead() public pure {
+        SourcingMathLib.BoundParams memory p = _params(1e19, false, 0.001e18);
+        uint256 assumed = SourcingMathLib.boundBySlippage(p);
+        uint256 walked = SourcingMathLib.boundBySlippage(_withBook(p, _book(0, 1, 20, -2e18)));
+
+        assertGt(assumed, 0, "the single-step path stopped quoting");
+        assertLt(walked, assumed, "reading the book did not cost the optimistic bound anything");
+    }
+
+    /// @dev And it stays a bound. A book that describes a cliff one tick above spot — everything,
+    /// then nothing — quotes only what fits below the cliff, which is an order of magnitude less
+    /// than the same budget quotes when the model is free to assume the book continues. Note what
+    /// it is *not*: zero. The part of the swap the book does account for is real, and refusing it
+    /// would be its own kind of wrong answer.
+    function test_theBoundStopsAtTheCliffTheBookDescribes() public pure {
+        SourcingMathLib.TickStep[] memory cliff = new SourcingMathLib.TickStep[](1);
+        cliff[0] = SourcingMathLib.TickStep({sqrtPriceX96: TickMath.getSqrtPriceAtTick(1), liquidityNet: -1e19});
+
+        uint256 assumed = SourcingMathLib.boundBySlippage(_params(1e19, false, 0.001e18));
+        uint256 walked = SourcingMathLib.boundBySlippage(_withBook(_params(1e19, false, 0.001e18), cliff));
+
+        assertGt(walked, 0, "the fill that fits under the cliff is still quotable");
+        assertLt(walked, assumed / 5, "the cliff did not cut the quote");
+    }
+
+    /// SELF-THINNING MEETS THE WALK ///
+
+    /// @dev **Finding A and D6 in the same call, which nothing else covered.** Self-thinning only
+    /// applies when the route venue *is* the parked venue, and every test that set that flag until
+    /// now used the deep default book, so the burn was subtracted from a book the swap never
+    /// walked. The two compound: the burn thins the liquidity the residual starts against, and the
+    /// walk then charges for crossing out of what is left.
+    function test_selfThinningAndTheWalkCompound() public pure {
+        SourcingMathLib.TickStep[] memory book = _book(0, 1, 20, -1e18);
+
+        uint256 sameVenue = SourcingMathLib.boundBySlippage(_withBook(_params(1e19, true, 0.001e18), book));
+        uint256 elsewhere = SourcingMathLib.boundBySlippage(_withBook(_params(1e19, false, 0.001e18), book));
+
+        assertGt(elsewhere, 0, "the control quoted nothing, so the comparison is empty");
+        assertLt(sameVenue, elsewhere, "burning into the book being walked cost nothing");
+
+        // Not the active-share cap doing the work: at this route depth the cap allows 5e18 and the
+        // whole position is 1e18, so it never binds and what is left is finding A plus the walk.
+        assertEq(
+            SourcingMathLib.maxBurnableLiquidity(_params(1e19, true, 0.001e18)),
+            LIQUIDITY,
+            "the cap bound first, so this measures the cap rather than self-thinning"
+        );
+    }
+
+    /// @dev **The documented double-count, made a number.** `multiStepOut` takes active liquidity
+    /// already net of the burn and never adds it back, so when the walk reaches the parked
+    /// position's own boundary tick it subtracts the burn a second time — once at the start and
+    /// once inside that tick's `liquidityNet`, which still describes the position at full size.
+    ///
+    /// @dev The library says this is deliberate and errs downward. Until now that was a claim in a
+    /// comment. Here it is the difference between the book as read and the book a position-aware
+    /// model would use, where the boundary gives back the `dL` that is no longer there.
+    function test_theBurnIsCountedTwiceAtThePositionsOwnBoundaryAndThatUnderStates() public pure {
+        uint128 routeLiquidity = 1e18;
+        uint128 parked = 4e17;
+        uint128 dL = 1e17;
+
+        // The parked position's upper edge: crossing it removes the whole position, at the size the
+        // pool still thinks it is.
+        SourcingMathLib.TickStep[] memory asRead = new SourcingMathLib.TickStep[](2);
+        asRead[0] =
+            SourcingMathLib.TickStep({sqrtPriceX96: TickMath.getSqrtPriceAtTick(10), liquidityNet: -int128(parked)});
+        asRead[1] = SourcingMathLib.TickStep({sqrtPriceX96: TickMath.getSqrtPriceAtTick(500), liquidityNet: -1e15});
+
+        // What a position-aware model would walk: the boundary only removes what is still there.
+        SourcingMathLib.TickStep[] memory corrected = new SourcingMathLib.TickStep[](2);
+        corrected[0] =
+            SourcingMathLib.TickStep({sqrtPriceX96: asRead[0].sqrtPriceX96, liquidityNet: -int128(parked - dL)});
+        corrected[1] = asRead[1];
+
+        (uint256 conservative,, bool completeA) = SourcingMathLib.multiStepOut(_swap(routeLiquidity - dL, 2e15, asRead));
+        (uint256 exact,, bool completeB) = SourcingMathLib.multiStepOut(_swap(routeLiquidity - dL, 2e15, corrected));
+
+        assertTrue(completeA && completeB, "both books should absorb this swap");
+        assertLt(conservative, exact, "the double-count is not actually costing anything, so it is untested");
     }
 }

@@ -235,11 +235,21 @@ contract UniswapV4NftBuyCallbackTest is V4ParkedBase {
 
     /// @dev **Where v4's thinness turns into a smaller quote.** Same maker, same pair, same fee
     /// tier: on v3 the bound is the whole position, because that position is 1% of the book. Here
-    /// the parked 2k+2k is **59% of the pool's active liquidity**, and two separate things cut the
+    /// the parked 2k+2k is **59% of the pool's active liquidity**, and three separate things cut the
     /// quote down. `SourcingMathLib.MAX_ACTIVE_SHARE_WAD` refuses to consider burning past half the
     /// book at all — finding B, without which the bisection would be searching a function that no
-    /// longer rises. Inside that cap, the 1bp budget reaches about **245 USDC**, roughly 6% of the
-    /// position's paper value.
+    /// longer rises. Inside that cap, the 1bp budget binds. And inside *that*, the walk crosses:
+    /// this pool's first initialized tick is one tick from spot, so a residual of any size leaves
+    /// the active range immediately.
+    ///
+    /// @dev **Pinned exactly, because a range would not notice the walk going away.** The
+    /// single-step model quotes **245.214731** here against the walk's **214.661289** — 14.23%
+    /// more. Both settle, so unlike v3 this is not a bound failing open; it is a bound spending
+    /// more of the maker's price than they signed for. The 1bp budget is the promise, and the
+    /// single step reaches that extra 30.55 USDC of size only by mispricing what the residual costs
+    /// once it crosses. Different failure from v3's, same cause, and the reason the number is
+    /// asserted rather than bracketed: replacing `multiStepOut` with `singleStepOut` used to leave
+    /// every test in both v4 suites green.
     ///
     /// @dev That is the bound working, not failing. A maker who *is* most of the venue cannot sell
     /// most of the venue into itself at spot, and a quote that said otherwise would hand the taker
@@ -250,10 +260,11 @@ contract UniswapV4NftBuyCallbackTest is V4ParkedBase {
         uint128 parked = _liquidityFor(PARKED_USDC, PARKED_USDT);
         assertGt(uint256(parked) * 2, active, "the maker is no longer past the active-share cap");
 
-        uint256 bound = callback.buyerAssetsBound(bytes32(0), market, maker, _callbackData());
-
-        assertGt(bound, 100e6, "bound collapsed to nothing on a venue that can still trade");
-        assertLt(bound, 500e6, "bound ignores the depth of the venue it has to sell into");
+        assertEq(
+            callback.buyerAssetsBound(bytes32(0), market, maker, _callbackData()),
+            214_661289,
+            "the v4 bound moved; single-step is 245.214731, so check the walk before re-pinning"
+        );
     }
 
     /// @dev A second callback over the same NFT, differing only in budget and route venue. Possible
@@ -277,7 +288,13 @@ contract UniswapV4NftBuyCallbackTest is V4ParkedBase {
     /// stating. Routing into its own pool means burning thins the book, so
     /// `MAX_ACTIVE_SHARE_WAD` caps the burn at half the pool's active liquidity: 665.88e9 against a
     /// position of 788.96e9, or 84.4% of it. Routing elsewhere thins nothing there, so no cap
-    /// applies and the whole position is reachable. The quotes come out in exactly that ratio.
+    /// applies and the whole position is reachable.
+    ///
+    /// @dev The quotes come out in that ratio to within a couple of percent rather than exactly,
+    /// and the wedge arrived with D6. Under a single step at constant `L` both quotes were linear
+    /// in the burn, so the ratio *was* the cap; the walk prices two different books across two
+    /// different sets of crossed ticks, and those do not cancel. Tolerance widened to 3% and the
+    /// claim narrowed to match — the cap is what explains the gap, not the last basis point of it.
     ///
     /// @dev A flag stuck `true` would cap both and lose the gap; stuck `false` would cap neither.
     function test_theActiveShareCapAppliesOnlyWhenTheRouteIsTheParkedVenue() public {
@@ -292,7 +309,7 @@ contract UniswapV4NftBuyCallbackTest is V4ParkedBase {
         // position. Derived from live state rather than hard-coded, so it stays true if the fork
         // block moves.
         uint256 capRatio = (uint256(_activeLiquidity() / 2) * 1e18) / _liquidityFor(PARKED_USDC, PARKED_USDT);
-        assertApproxEqRel((capped * 1e18) / uncapped, capRatio, 0.01e18, "the gap is not the active-share cap");
+        assertApproxEqRel((capped * 1e18) / uncapped, capRatio, 0.03e18, "the gap is not the active-share cap");
     }
 
     /// @dev The other side of the same flag. Once the budget binds instead of capacity, the ordering

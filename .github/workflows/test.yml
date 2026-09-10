@@ -2,8 +2,14 @@ name: CI
 
 permissions: {}
 
+# `push` is restricted to `main`. Unrestricted, a branch with an open PR runs this job twice
+# concurrently — once for the push, once for the pull_request — and the two race each other for
+# the public Base endpoint's rate limit. The whole suite forks Base, so a duplicate run doubles
+# the RPC volume for no extra coverage, and D6's tick walk raised the number of distinct storage
+# slots each test touches enough to make that reliably fatal (HTTP 429, "over rate limit").
 on:
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
