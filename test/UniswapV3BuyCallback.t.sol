@@ -303,23 +303,6 @@ contract UniswapV3BuyCallbackTest is ParkedPositionBase {
         assertEq(IERC20Meta(USDC).balanceOf(address(callback)), 1_000e6, "buffer was spent");
     }
 
-    /// @dev A second callback over the same parked position, differing only in budget and route.
-    function _routedCallback(uint256 budgetWad, address routePool, uint256 salt)
-        internal
-        returns (UniswapV3BuyCallback routed)
-    {
-        routed = UniswapV3BuyCallback(factory.createCallback(maker, priceRef, budgetWad, routePool, bytes32(salt)));
-    }
-
-    /// @dev ERC-721 approval is a single slot per `tokenId`, so approving one callback revokes the
-    /// last. Every use site approves at the point of use; approving inside `_routedCallback` would
-    /// silently disarm whichever callback was built first, and an `onBuy` that reverts on approval
-    /// satisfies any assertion about what it sourced by never running.
-    function _approve(UniswapV3BuyCallback routed) internal {
-        vm.prank(maker);
-        INonfungiblePositionManager(V3_POSITION_MANAGER).approve(address(routed), tokenId);
-    }
-
     /// QUOTING ///
 
     /// @dev The budget does not bind on this venue: the maker's position is 1% of the pool's active

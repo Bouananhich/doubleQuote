@@ -1014,3 +1014,109 @@ a position-aware model would walk, and asserting the difference is real and nega
 **175/175.** Mutation-checked again, since the whole finding was that a green suite proved nothing:
 deleting the walk now fails 4 v4 tests and 8 library tests; deleting self-thinning fails 6 and 2.
 Both were zero and zero on one side before this round.
+
+## 2026-09-10 — D7: the griefing test, and what it settles about D8
+
+The maker's residual swap is sandwichable, it is worth sandwiching, and the number is large:
+**a 5,000 USDC fill costs the maker 3,092.76 USDC — 61.86% of the fill** — of which the attacker
+takes 2,995.19 and the route pool's LPs take the remaining 97.57 in fees. The attacker risks a
+3,000 USDT round trip and holds the same USDT at the end. `test/SandwichV3.t.sol`, against a real
+`take()` on the deployed Midnight, every figure pinned at `FORK_BLOCK`.
+
+### The maker pays in liquidity, not in price
+
+This is the part I had wrong going in. I expected the harm to be "the residual sold cheap and the
+maker ate the difference" — a bounded loss, roughly the slippage on one leg. It is not, because
+`onBuy` has no discretion: it must deliver `shortfall` or revert. A residual that fetches less USDC
+does not settle for less, it **burns more liquidity until the loan is covered**. The maker pays the
+attacker out of the LP position, at a size the maker never authorised and cannot see coming.
+
+So the loss is not set by the price move. It is set by `escalationCeiling`. Measured: the honest
+fill burns 1,004,421,974,055 and the attacked fill burns 2,008,843,948,110 — **exactly twice, which
+is the ceiling, and it will be exactly twice for any attack large enough to trigger escalation at
+all.** The D3 ceiling turns out to be doing a second job nobody designed it for: it is the cap on
+this attack's payout. Without it, the fallback it replaced would have handed over the whole position.
+
+Worth stating plainly because it inverts the intuition: the escalation path is what makes the take
+*settle*, and settling is what makes the attack profitable. A callback that simply reverted when the
+first burn came up short would lose the maker nothing here. It would also fail honest fills on any
+venue with real impact, which is why D3 added escalation in the first place. The two goals are in
+direct tension and D8 is where they get resolved — not by removing escalation, but by giving it a
+price it is not allowed to cross.
+
+### The decision this forces: D8 guards realised execution, not spot
+
+The obvious `IPriceRef` design is to compare the route pool's `slot0` against the reference and
+refuse to trade when they disagree by more than `MAX_SLIPPAGE_WAD`. **That design does not stop this
+attack, and the test says so with a number.**
+
+| | WAD | vs 10bp budget |
+|---|---|---|
+| Front-run's displacement of route spot | 0.00077014 | **7.70bp — inside** |
+| Realised price, honest fill | 0.00081275 | 8.13bp — inside |
+| Realised price, attacked fill | 0.61341790 | **61.34% — 613x over** |
+
+The front-run moves spot by less than the maker's entire budget. A spot-versus-reference guard waves
+it straight through. The damage is not displacement — it is that the front-run **eats the book the
+residual then has to walk**, and the residual is itself twice the size it should have been because
+the shortfall forced an escalation. Only the realised price sees all three effects, and it is the
+one number that lines up with the loss: 61.34% deviation against 61.86% of the fill destroyed.
+
+So `IPriceRef` gives D8 a reference, but the check is `amountOut >= expectedAt(reference) * (1 -
+MAX_SLIPPAGE_WAD)` on the actual swap output — a `minOut` derived on-chain from an oracle the
+attacker cannot move, which is exactly the protection the D2 docstring flagged as missing. Checking
+`slot0` first is *not* a cheap pre-filter worth adding as well: it costs a read, it catches nothing
+this does not, and it would encourage the reading that spot proximity means a safe execution.
+
+### D8 has less than 2bp of slack
+
+The honest fill realises **8.13bp against the 10bp budget**. That is D6's bound working — it quoted
+a fill that is genuinely inside the budget — but it leaves under 2bp between an honest fill and a
+guard that refuses it. D8 cannot be sloppy about which price it derives `minOut` from or how it
+rounds. A guard that is 2bp pessimistic starts reverting fills the bound correctly promised, which
+is a bound that over-promises again, by a different mechanism.
+
+This also means the D8 test cannot just assert "attacked take reverts". It has to assert both
+directions on the same callback — honest fill still settles, attacked fill reverts — or it will pass
+against a guard that refuses everything.
+
+### The exposure is a maker configuration, not a property of the design
+
+The identical attack routed through the deep 0.01% pool the position is parked in **loses the
+attacker 0.56 USDC**. Moving a venue ~50x thicker costs more in fee and impact than the take is
+worth. So the honest claim is not "Uniswap-parked callbacks can be sandwiched" — it is "a callback
+routing through a venue an attacker can afford to move can be sandwiched", and `ROUTE_POOL` is an
+immutable the maker picks at deployment.
+
+That is a better result than a blanket vulnerability, because it is actionable: the maker can be
+told what depth ratio is safe, and D11's frontier chart is the natural place to say it. It also
+retroactively justifies invariant 5. Park is permissionless and route is not, and the reason is
+right here — the venue the maker is *forced* to trade in is the one an attacker gets to choose the
+price of.
+
+### What D8 does not fix, and the suite says so
+
+An attacker who never takes at all can just move the route venue and make a quote read one block
+earlier unfillable. Bisected: 3,000 USDT leaves the 9,838.85 bound fillable, **6,000 kills it, for a
+round-trip cost of 5.47 USDC**. The take fails closed — `InsufficientSourced`, no debt, no credit,
+the position untouched — so it is censorship of the offer, not theft from it.
+
+No bound computed at block N can promise anything about block N+1, so this is not a bug and D8 will
+not close it. It is in the suite as a standing test because the D8 write-up will otherwise read as
+"the sandwich problem is solved", and the accurate claim is narrower: a price reference stops the
+maker being *robbed* between quote and block, not being *stalled*. Cheap censorship of a fixed-rate
+offer is a real property of routing through a venue this thin and belongs in the limitations column,
+next to the off-range note from D5.
+
+### Mutation-checked, per the D6 habit
+
+A green griefing suite proves nothing on its own — the attack could be inert and every assertion
+still hold. Two mutations, both made to fail on purpose:
+
+- **Escalation disabled** (`if (false && sourced < shortfall …)`): the attacked take reverts with
+  `InsufficientSourced` and two tests fail. That is the mechanism claim above, confirmed from the
+  other side — with no escalation the maker loses nothing here, because nothing settles.
+- **The deep-venue test pointed at the thin pool**: profit flips from -0.56 to +2,995.19, failing
+  its assertion, and reproduces the sandwich test's figure to the wei. The venue is the only
+  variable between them, which is what makes "it is the maker's route configuration" a measurement
+  rather than a story.

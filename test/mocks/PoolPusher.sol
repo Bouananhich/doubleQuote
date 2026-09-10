@@ -32,6 +32,20 @@ contract PoolPusher is IUniswapV3SwapCallback {
             );
     }
 
+    /// @dev The other half of a sandwich: buy back exactly what the front-run sold, so the pusher
+    /// ends holding the amount of the pushed token it started with and its whole profit or loss is
+    /// denominated in the other one. Exact output, hence the negative `amountSpecified`.
+    function buy(address pool, bool zeroForOne, uint256 amountOut) external {
+        IUniswapV3Pool(pool)
+            .swap(
+                address(this),
+                zeroForOne,
+                -int256(amountOut),
+                zeroForOne ? MIN_SQRT_PRICE + 1 : MAX_SQRT_PRICE - 1,
+                abi.encode(pool)
+            );
+    }
+
     function uniswapV3SwapCallback(int256 amount0Delta, int256 amount1Delta, bytes calldata data) external {
         address pool = abi.decode(data, (address));
         require(msg.sender == pool, "not the pool");

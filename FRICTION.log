@@ -165,3 +165,37 @@ part that makes the feedback actionable and the part that is impossible to recon
     RPC-expensive rather than gas-expensive. An official `view` quoter that walks ticks without
     simulating-and-reverting would be the thing that makes this cheap for everyone.
     (cost: ~10m, all of it diagnosis)
+
+2026-09-10 11:05  [v3 / v4-core]  `slot0` and a realised fill price are quoted in opposite
+    directions, and getting it wrong manufactures exactly the bug you are hunting.
+    Measuring what the callback's residual sale actually got, to compare against the maker's
+    slippage budget. The realised price falls out of the swap as `amountOut / amountIn` — USDC per
+    USDT here, i.e. token0 per token1. `slot0`'s `sqrtPriceX96` is token1 per token0. They are
+    reciprocals, so a direct comparison is wrong by construction, and the failure is quiet: an
+    honest unattacked fill reported a 22.67bp deviation against a 10bp budget instead of its real
+    8.13bp. That is a plausible-looking budget breach in a test suite whose entire purpose is
+    finding budget breaches, so it reads as a finding rather than as a unit error. It only came
+    apart because the attacked number, 61.34%, matched the independently-measured 61.86% loss and
+    the honest one matched nothing.
+    Not a bug in Uniswap — the orientation is documented and consistent. The friction is that
+    nothing in the type system distinguishes the two, both are `uint256` WADs near 1e18 for a
+    stable pair, and the sign of the error is small for small moves, so it survives a smoke test.
+    A `sqrtPriceX96 -> price` helper in the periphery libraries taking the desired orientation as
+    an argument would be the fix; every integrator writes this by hand today. Ended up routing both
+    venues through a single `_priceOfResidual` so the inversion cannot be applied to one side of a
+    comparison and not the other.
+    (cost: ~25m)
+
+2026-09-10 11:30  [v3]  there is no way to ask a pool what price a swap just executed at.
+    Wanted the blended realised price over a settlement that hits the route venue twice (a sized
+    burn plus an escalation). The `Swap` event carries per-swap amounts, so it means decoding two
+    events and summing them; `slot0` after the fact gives the *ending* price, not the average, and
+    for a swap that walks several ticks those differ by the whole point of the measurement.
+    Settled on reading the pool's ERC-20 balances before and after the take and dividing, which is
+    exact and aggregates naturally, but only works because nothing else moves that pool's balances
+    inside the transaction — true here since park and route are different pools, and quietly false
+    for any maker who routes through the venue they park in.
+    The general shape: v3 tells you where the price *is* and what each swap *did*, but a callback
+    or a guard reasoning about execution quality wants the average price of its own fill, and has
+    to reconstruct it. Same gap the `minOut` pattern papers over off-chain.
+    (cost: ~10m)

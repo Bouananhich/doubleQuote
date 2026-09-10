@@ -166,7 +166,43 @@ so the crossing they do exercise was never pinned. Now exact — 214.661289 agai
 **Next:** D7 — the griefing test on v3. Note that D6 changed what it is testing against: the bound
 now refuses to quote a fill the route venue cannot absorb, so an attacker who moves the pool is
 attacking a quote that already knows how deep the book is. The loss to quantify is what happens
-between the quote and the block, which is what `PRICE_REF` exists for at D8.
+between the quote and the block, which is what `PRICE_REF` exists for at D8. *(Confirmed on D7 —
+that framing was right, and the loss is 61.86% of the fill.)*
+
+## D7 — done
+
+`test/SandwichV3.t.sol`, against a real `take()` on the deployed Midnight. **179/179.**
+
+- **The number: a 5,000 USDC fill costs the maker 3,092.76 USDC, 61.86% of the fill.** The attacker
+  takes 2,995.19 of it and the route pool's LPs take the remaining 97.57 in fees, for a 3,000 USDT
+  round trip that ends holding the same USDT it started with.
+- **The maker pays in liquidity, not in price.** `onBuy` must deliver `shortfall` or revert, so a
+  residual that fetches less USDC does not settle for less — it burns more liquidity until the loan
+  is covered. Honest burn 1,004,421,974,055; attacked burn 2,008,843,948,110, **exactly the
+  escalation ceiling**, and it will be exactly the ceiling for any attack big enough to trigger
+  escalation at all. D3's ceiling turns out to also be the cap on this attack's payout.
+- **A spot-versus-reference guard would not have caught it, and that decides D8's shape.** The
+  front-run displaces route spot by **7.70bp — inside the maker's 10bp budget**. The realised
+  execution price deviates by **61.34%**, which is the number that matches the loss. D8 derives a
+  `minOut` from `PRICE_REF` and checks the swap's actual output; it does not compare `slot0`.
+- **D8 has under 2bp of slack.** The honest fill realises 8.13bp against the 10bp budget. The D8
+  test has to assert both directions on one callback — honest fill still settles, attacked fill
+  reverts — or it passes against a guard that refuses everything.
+- **The exposure is a maker configuration, not a property of the design.** The identical attack
+  routed through the deep 0.01% pool the position is parked in *loses* the attacker 0.56 USDC.
+  The claim is "a callback routing through a venue an attacker can afford to move", and `ROUTE_POOL`
+  is an immutable the maker picks. D11's frontier chart is where the safe depth ratio gets stated.
+- **One harm D8 will not fix, kept as a standing test.** An attacker who never takes can move the
+  route venue and make a quote read one block earlier unfillable: 3,000 USDT leaves the 9,838.85
+  bound fillable, **6,000 kills it for a round-trip cost of 5.47 USDC**. It fails closed — no debt,
+  no credit, position untouched — so it is censorship of the offer, not theft from it. No bound
+  computed at block N can promise anything about block N+1. Limitations column, next to D5's
+  off-range note.
+- `MidnightMarketBase` split out of `MidnightIntegration.t.sol` so both take-driven suites share one
+  market, ratifier and taker; `_routedCallback`/`_approve` moved down to `ParkedPositionBase`.
+
+**Next:** D8 — `V3TwapRef` and the reference-relative bound in `onBuy`, then re-run this suite with
+the assertions inverted.
 
 Build order is **v3 first, v4 second, both shipped**. v3 is load-bearing — its native
 `observe()` makes the price-reference work straightforward. If a day goes missing, v4 is cut,
@@ -210,7 +246,7 @@ The prep window (Mon 31 Aug → Thu 3 Sep) was not used. These are prerequisites
 | **D4** (Mon 7) | **v4 happy path.** Whole unwind inside one `PoolManager.unlock()` — `modifyLiquidity`, swap residual, settle one netted delta. Naive `buyerAssetsBound` on both. |
 | **D5** (Tue 8) | `SourcingMathLib` single-step version ✅ — exact to the wei on the stable pool against a real `take()`. `max_share` cap included, and it binds on v4. |
 | **D6** (Wed 9) | Multi-tick walk ✅ — `TickBookLib` + `computeSwapStep`, bisection on top. The +25.33% fail-open on a thin route venue is gone; the deep venue is unchanged to the wei. |
-| **D7** (Thu 10) | **The griefing test**, on v3. Attacker moves the pool, takes the offer, callback swaps into the manufactured price. Quantify the maker's loss. |
+| **D7** (Thu 10) | **The griefing test**, on v3 ✅. Attacker moves the pool, takes the offer, callback swaps into the manufactured price. Maker's loss: **61.86% of the fill**, paid in burnt liquidity at the escalation ceiling. Settles D8's shape — guard realised execution, not spot. |
 
 ## Week 2 — Fri 11 → Fri 18 Sep
 
