@@ -321,3 +321,34 @@ part that makes the feedback actionable and the part that is impossible to recon
     is accurate to one tick spacing of the *oracle* pool and that budgets below that are not
     meaningful.
     (cost: ~50m, most of it spent looking for a bug in my own port)
+
+2026-09-10 21:40  [midnight]  `take` looks unsigned, and offers are signed somewhere else.
+    `take(Offer offer, bytes ratifierData, uint256 units, ...)` has no signature parameter. Reading
+    the interface, the honest conclusion is that a Midnight offer is an unsigned struct and the
+    maker's consent must live entirely in on-chain authorisation — which is what I concluded, and it
+    is wrong. Offers are signed; the signature travels inside `ratifierData` and is verified by the
+    ratifier the offer names, and Morpho operates a canonical `EcrecoverRatifier` on Base for
+    exactly this.
+    Nothing in `IMidnight` points at that. `ratifierData` is `bytes`, the natspec on `take` does not
+    say what belongs in it, and `IRatifier.isRatified` is generic by design. The information exists
+    — in the `midnight-pocs` repo and the SDK — but the interface an integrator reads first actively
+    suggests the opposite, and "this protocol has no offer signatures" is a conclusion that changes
+    how you design a whole integration.
+    One line on `take` naming `EcrecoverRatifier` as the standard scheme, or a `@dev` pointing at
+    `src/ratifiers/`, would close it. The design underneath is good: signing a Merkle root means one
+    signature authorises a whole book and `cancelRoot` retires it in one transaction.
+    (cost: ~40m, and a bespoke ratifier contract written for a problem that did not exist)
+
+2026-09-10 21:55  [midnight]  Constructing an offer hash pulls in a compiler requirement.
+    This project binds deployed Midnight through interfaces only, on one compiler profile with no IR
+    pipeline — which works for every interface and library it imports, right up to `HashLib`. That
+    is the first Midnight source it *compiles* rather than binds, and it does not fit in the stack
+    without `via_ir`: Midnight's own `foundry.toml` sets it, ours deliberately does not.
+    So an integrator's compiler settings are free of Midnight's exactly until they need to construct
+    or verify an offer, and then they are not. That is a surprising place for a build dependency to
+    surface, and nothing signposts it — `HashLib` looks like an ordinary internal library.
+    Worked around with a path-scoped `compilation_restrictions` entry so the rest of the build keeps
+    its single profile. A note in the ratifier docs saying "these need via_ir" would have saved the
+    diagnosis; shipping a precomputed-digest helper, or a view function on the ratifier that returns
+    the digest for an offer, would remove the need to compile it at all.
+    (cost: ~25m)

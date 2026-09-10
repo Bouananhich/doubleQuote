@@ -1509,3 +1509,68 @@ share one `tokenId`, and it now fails as it must.
 Second time this week a mutation has been too weak to catch its own target — the D9 licence check
 was the first. The pattern in both: the test exercised the path I had in mind instead of the claim I
 had made. **Check that a probe fails for the reason you intend, not merely that it fails.**
+
+## 2026-09-10 (demo) — Offers are signed after all, and there is a public orderbook
+
+Two things I got wrong while scoping the demo, both corrected by the maker pointing at Morpho's own
+app, and both worth recording because the wrong version was *plausible*.
+
+**"`take` carries no signature."** True of the function signature, and false about the protocol.
+`take(Offer, bytes ratifierData, ...)` has no signature parameter, so reading the interface alone
+suggests offers cannot be signed. They are: the signature travels in `ratifierData` and is verified
+by the ratifier the offer names. Morpho operates a canonical one — **`EcrecoverRatifier` at
+`0xd6e70365C8E8DDa9a4ca662C07bbE663b017755E`**, 4,139 bytes, live on Base — so the demo needs no
+authorisation contract of its own and `script/DemoRatifier.sol` is scaffolding I wrote for a problem
+that did not exist.
+
+The scheme signs an **EIP-712 hash of a Merkle root of offers**, which is a better design than the
+one I assumed: one signature authorises a whole book, and `cancelRoot` retires all of it in one
+transaction. A single offer is the degenerate case — empty proof, `leafIndex` 0, root equal to the
+offer hash. `test/DemoPreflight.t.sol` now settles a signed 10 USDC fill through the deployed
+ratifier on a fork.
+
+**"There is no orderbook to submit to."** Also wrong. `https://api.morpho.org/v0/midnight/` serves
+`/markets` and `/books`, and `/books` returns real aggregated depth — bids and asks by tick, with
+counts — which is what the app renders. The docs describe "Router mempool rules" and note that "the
+Router checks before indexing an offer". So the whitelisting question I declared moot is real and
+still open: *will the Router index an offer naming an unknown callback?* Worth probing, and the
+answer is `FEEDBACK.md` material either way.
+
+What misled me was a docs sentence — "Midnight does not broadcast offers itself, they circulate
+through external channels" — which is a statement about the **core protocol**, not about whether
+Morpho runs an indexer. I generalised from the contract interface plus one sentence, and both were
+locally accurate. The tell I ignored: my own earlier search result contained the phrase "mempool
+validation", and I read past it because it did not fit the conclusion I had already drawn.
+
+**The demo is better for it.** It now uses a real market (cbBTC/USDC, 86% LLTV, the real
+`0x663BECd1…` oracle, December 2026 maturity, taken from Morpho's own limit-order POC) and Morpho's
+real ratifier, instead of a stub oracle and a bespoke ratifier I invented. Two fakes removed.
+
+## 2026-09-10 (demo) — The first Midnight source we compile rather than bind
+
+Every Midnight dependency so far has been an interface or a small library, which is why the
+single-profile promise in `CLAUDE.md` held: bind the deployed contracts, never compile them.
+`HashLib` breaks that. It is needed to construct an offer hash, and it does not fit in the stack
+without the IR pipeline — Midnight's own `foundry.toml` sets `via_ir = true`, and ours deliberately
+does not.
+
+Resolved with a **path-scoped** restriction rather than a global setting:
+
+```toml
+[[profile.default.additional_compiler_profiles]]
+name = "midnight-ir"
+via_ir = true
+
+[[profile.default.compilation_restrictions]]
+paths = "lib/midnight/src/ratifiers/**"
+via_ir = true
+```
+
+Everything else still compiles under one profile with no IR, so the promise holds where it was
+actually load-bearing — the adapters, the libraries, the price refs. Only the one imported path that
+cannot compile any other way is exempt, and it is Midnight's code rather than ours.
+
+Worth noting the shape of it for `FEEDBACK.md`: an integrator can bind Midnight through interfaces
+on their own compiler settings right up until they need to **construct or verify an offer**, at
+which point they inherit Midnight's. That is a surprising place for a compiler dependency to appear,
+and nothing signposts it.

@@ -26,22 +26,34 @@ different regime.
 |---|---|
 | `buyerAssetsBound` at $10/side | **19.871711 USDC** — and a take of exactly that settles, to the wei |
 | A round 10 USDC fill | burns **exactly 50%** of the position |
+| A signed offer via `EcrecoverRatifier` | **settles** — 10 USDC, through Morpho's deployed contract |
 | Maker taking their own offer | refused, `SelfTake()` — **two funded addresses are required** |
 | `ratifier = address(0)` | refused, `RatifierUnauthorized()` |
-| An EOA as ratifier | refused — a ratifier must be a contract, hence `script/DemoRatifier.sol` |
+| An EOA as ratifier | refused — a ratifier must be a contract |
 
 The 50% number is the one to show: half the LP settles the loan, half stays in the pool earning.
 
-## Two things worth understanding first
+## How an offer is actually authorised
 
-**`take` carries no signature.** An offer is a plain struct the taker supplies. The maker's consent
-is `setIsAuthorized(ratifier, true, maker)` plus the NFT approval — nothing is signed and nothing is
-posted. "Publishing an offer" means letting someone see the struct, which is why Midnight's own docs
-say offers "circulate through external channels".
+`take` has no signature *parameter*, which is misleading at first glance. Offers **are** signed: the
+signature travels in `ratifierData` and is checked by the ratifier the offer names. Morpho operates a
+canonical one, **`EcrecoverRatifier` at `0xd6e70365C8E8DDa9a4ca662C07bbE663b017755E`** on Base, so
+this demo deploys no authorisation contract of its own.
 
-**So the offer will not appear in anyone's UI.** There is no orderbook to submit to. The taker step
-below is a CLI call because that is what taking an offer *is*, not because we are working around
-something.
+The scheme signs a **Merkle root of offers**, so one signature can authorise a whole book and
+`cancelRoot` retires it in a single transaction. A single offer is the degenerate case: empty proof,
+`leafIndex` 0, root equal to the offer hash. `test/DemoPreflight.t.sol` proves a signed offer settles
+through the deployed ratifier against a Base fork.
+
+**There is a public orderbook.** Morpho indexes offers and the app renders the depth; the REST API at
+`https://api.morpho.org/v0/midnight/` serves `/markets` and `/books`. Because the offer this demo
+produces is a *standard* signed Midnight offer, it is publishable in principle — whether the Router's
+mempool rules index one naming an unknown callback is an open question, and worth probing as part of
+the demo since the answer is `FEEDBACK.md` material either way.
+
+Settlement does not depend on any of that. As Morpho's own limit-order POC puts it, "a signed
+Midnight offer is an offchain object and can be passed directly to `Midnight.take`; API publication
+and discovery are not prerequisites for settlement."
 
 ## Setup
 

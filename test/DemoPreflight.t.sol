@@ -5,6 +5,8 @@ import {INonfungiblePositionManager, IUniswapV3Pool} from "../src/interfaces/IUn
 import {UniswapV3BuyCallback} from "../src/UniswapV3BuyCallback.sol";
 
 import {Offer} from "midnight/src/interfaces/IMidnight.sol";
+import {Signature, EIP712_DOMAIN_TYPEHASH} from "midnight/src/ratifiers/interfaces/IEcrecoverRatifier.sol";
+import {HashLib} from "midnight/src/ratifiers/libraries/HashLib.sol";
 
 import {MidnightMarketBase} from "./MidnightMarketBase.sol";
 import {IERC20Meta} from "./interfaces/IUniswapMinimal.sol";
@@ -21,6 +23,10 @@ contract DemoPreflightTest is MidnightMarketBase {
     /// @dev What the demo actually funds. Ten dollars a side.
     uint256 internal constant DEMO_USDC = 10e6;
     uint256 internal constant DEMO_USDT = 10e6;
+
+    /// @dev Morpho's canonical signature ratifier, deployed on Base. 4,139 bytes of code at
+    /// `FORK_BLOCK`, verified in this suite rather than taken from a package.
+    address internal constant ECRECOVER_RATIFIER = 0xd6e70365C8E8DDa9a4ca662C07bbE663b017755E;
 
     UniswapV3BuyCallback internal demo;
     uint256 internal demoTokenId;
@@ -175,5 +181,54 @@ contract DemoPreflightTest is MidnightMarketBase {
         IERC20Meta(CBBTC).approve(MIDNIGHT, collateral);
         midnight.supplyCollateral(market, 0, collateral, who);
         vm.stopPrank();
+    }
+
+    /// @dev **The real publication path.** An earlier version of this demo invented its own
+    /// ratifier, because `take` has no signature parameter and it looked as though offers could not
+    /// be signed at all. They can: the signature travels in `ratifierData`, and Morpho has a
+    /// canonical `EcrecoverRatifier` **deployed on Base** that verifies it. So the demo needs no
+    /// bespoke contract, and the offer it produces is a standard signed Midnight offer rather than
+    /// something only this repo can settle.
+    ///
+    /// @dev The scheme signs a **Merkle root of offers**, so one signature can authorise a whole
+    /// book and `cancelRoot` retires it in one transaction. A single offer is the degenerate case:
+    /// empty proof, `leafIndex` 0, and the root is the offer hash itself.
+    function test_theDemoOfferSettlesThroughMorphosDeployedRatifier() public {
+        // `makeAddr` is key-derived, so this is the fixture's own maker with its key recovered —
+        // no NFT transfer, no second position, nothing that could make the test pass for a reason
+        // other than the signature being valid.
+        (address signer, uint256 signerKey) = makeAddrAndKey("maker");
+        assertEq(signer, maker, "the signer is not the maker who owns the position");
+
+        vm.prank(maker);
+        midnight.setIsAuthorized(ECRECOVER_RATIFIER, true, maker);
+
+        Offer memory offer = _demoOffer(10e6);
+        offer.ratifier = ECRECOVER_RATIFIER;
+
+        bytes memory ratifierData = _sign(offer, signerKey);
+
+        _collateralize(10e6);
+        uint128 liquidityBefore = _demoLiquidity();
+
+        vm.prank(taker);
+        (uint256 buyerAssets,) = midnight.take(offer, ratifierData, 10e6, taker, taker, address(0), hex"");
+
+        assertEq(buyerAssets, 10e6, "the signed offer did not settle");
+        assertLt(_demoLiquidity(), liquidityBefore, "the position did not unwind");
+        emit log_named_uint("settled through the deployed EcrecoverRatifier (USDC)", buyerAssets);
+    }
+
+    /// @dev `abi.encode(Signature, root, leafIndex, proof)`, with the single-offer degenerate tree.
+    function _sign(Offer memory offer, uint256 key) internal view returns (bytes memory) {
+        bytes32 root = HashLib.hashOffer(offer);
+        bytes32[] memory proof = new bytes32[](0);
+
+        bytes32 structHash = keccak256(abi.encode(HashLib.offerTreeTypeHash(proof.length), root));
+        bytes32 domainSeparator = keccak256(abi.encode(EIP712_DOMAIN_TYPEHASH, block.chainid, ECRECOVER_RATIFIER));
+        bytes32 digest = keccak256(bytes.concat("\x19\x01", domainSeparator, structHash));
+
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(key, digest);
+        return abi.encode(Signature({v: v, r: r, s: s}), root, uint256(0), proof);
     }
 }
