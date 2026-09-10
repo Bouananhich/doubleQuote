@@ -1120,3 +1120,112 @@ still hold. Two mutations, both made to fail on purpose:
   its assertion, and reproduces the sandwich test's figure to the wei. The venue is the only
   variable between them, which is what makes "it is the maker's route configuration" a measurement
   rather than a story.
+
+## 2026-09-10 — D8: the fix, and three things it turned up on the way
+
+`V3TwapRef` plus a reference-relative cost guard in `onBuy`. **191/191.** The D7 sandwich now
+reverts at **44.60% against the maker's 10bp**, and the attacker who used to walk away with
+2,995.19 USDC walks away **−2,998.04**. The maker's position, buffer and NFT are untouched: the
+take fails closed.
+
+### The security property, measured rather than asserted
+
+The whole guard rests on the reference being expensive to move, so that is pinned as a number
+rather than a claim. Pushing 100,000 USDT through the very pool the reference reads drags spot from
+tick 7 to **18,819** — a ~7x price move — and the mean tick over 30 minutes stays on **7 exactly**,
+because a same-block push contributes zero elapsed seconds to the mean. One Base block later it has
+drifted to 27: 20 ticks against 18,812 of displacement, a tenth of a percent. Held for the whole
+window it converges on 18,819 exactly, which is the other half of being usable — a reference that
+never moved would refuse every fill after a genuine repricing.
+
+Worth recording what that probe also showed, because it is not what "deep pool" suggests: the
+0.01% USDC/USDT pool is deep only in a narrow band. 100k USDT exhausts it. Depth on a stable pair is
+a statement about a band, not about a pool, and D6 found the same shape on the 0.05% venue.
+
+### The denominator was nearly wrong, and the test that would have caught it did not exist yet
+
+The obvious guard is a `minOut` on the residual sale: value the residual at the reference, subtract
+the budget, require at least that much back. I wrote it that way, and it is wrong — not by a little.
+`boundBySlippage` measures cost over *sourced*, and a balanced position pays out roughly half its
+value as residual, so a guard on the residual leg alone is about twice as strict as the quote. The
+callback would have refused fills its own `buyerAssetsBound` had just promised.
+
+It surfaced only when I pointed the fixture at a real reference and honest fills started reverting.
+Quote and execution have to enforce one inequality or neither is trustworthy, so `costWad` takes
+`sourced` as its denominator and `onBuy` checks it once over both swaps rather than per-swap. A
+first swap that came in expensive can still settle honestly if the second is cheap, and a revert
+rolls back both burns anyway, so nothing is spent finding out.
+
+### The bound was promising fills the executor would not honour
+
+D5 and D6 built `boundBySlippage` to bisect on `dL` and report what that burn sourced. That answers
+"how much can this position source inside the budget", which is **not** the question
+`buyerAssetsBound` is documented to answer. `onBuy` does not burn the `dL` the model picked — it
+sizes the burn from the *fill*, through `liquidityForTarget`, which adds `IMPACT_MARGIN_BPS`.
+
+On a deep venue the margin is clamped away by available liquidity and the two agree to the wei,
+which is why nothing noticed for three days. On the thin route venue it inflates the burn, sells a
+larger residual into a nearly-spent book, and costs more than the quote promised: **a fill at
+exactly the quoted bound realised 16.93bp against a 10bp budget.** Before D8 that settled and the
+maker silently overpaid; after D8 it would have reverted, which is a bound failing open by a
+different door.
+
+The bisection now searches over **fill size** and sizes each candidate burn exactly the way the
+executor will, escalation included. Consequences, all measured:
+
+- The deep-venue answer is unchanged to the wei — still **19,871.458852**, still exact against a
+  real `take()`, because the clamp still applies there.
+- The thin v3 venue drops 9,838.854693 → **9,817.764107**, which is the 25bp margin being told the
+  truth about. Filling at the new number settles.
+- v4 drops 214.661289 → **214.128351**, 0.25%, same cause.
+- It is *cheaper*: ~35 iterations over a fill range instead of up to 128 over a `uint128`.
+
+Modelling the escalation in the predicate was not optional. Refusing to quote fills that need it is
+safe but halved the bound on the thin v4 venue — a maker's capital idle because the quote would not
+admit to behaviour the callback actually has.
+
+### And a rule that fell out of the search ceiling
+
+The search needs a top, and `sourcedFor(maxBurn)` cannot be it — that returns zero exactly when the
+route book cannot absorb the whole position's residual, which is the case the search exists for.
+The ceiling is the burn's paper value at the reference instead. That has a consequence I did not
+design and have chosen to keep: **the bound never promises more than the residual is worth at the
+maker's own reference**, even when the route venue would pay better. Quoting the excess would mean
+promising to capture a favourable deviation that can vanish between the quote and the block, which
+is the same asynchrony the bound exists to be honest about. Pinned in `SourcingMathLib.t.sol`.
+
+### D8 killed the escalation path on these venues, and pretending otherwise would have been fake coverage
+
+`liquidityForTarget` covers the route fee and a flat 25bp of impact, so the sized burn only falls
+short once impact exceeds 25bp. On a venue whose book above spot is a handful of ticks, the residual
+that costs 25bp and the residual that costs tens of percent are nearly the same trade. Bisected at
+`FORK_BLOCK` on the 0.05% route pool: a **2,400** USDT drain still settles in one burn inside 10%,
+and **2,500 costs 34.99%**. The constructor caps any budget at 10%, so no callback this factory can
+build would settle it — escalation is not merely expensive there, it is unreachable.
+
+The mechanism stays in the contract: a route venue with gradual depth rather than a cliff would
+separate the two thresholds. But the D3 test that exercised it through a drained venue can no longer
+do so, so it now runs against a deliberately neutralised stub reference, and a paired test states the
+finding with the numbers. Rewriting the test to "prove" escalation through a real reference would
+have meant inventing a configuration that does not exist.
+
+### Mutation-checked, and one mutation exposed a hole
+
+Three mutations. Deleting the cost guard fails 3 tests. Dropping the route fee from the executor's
+sizing fails 4. But **valuing the residual at route spot instead of the reference — undoing the
+central change of the day — failed exactly one assertion, by 0.9%**, because on a quiet fork the two
+prices agree to within a basis point and nothing in the suite set them apart.
+
+The fork test I reached for first did not close it either: front-running the route venue does collapse
+the quote, 9,817.764107 → 3,872.312997, but that is D6's book walk finding the venue spent, not D8's
+valuation. Two library tests now set reference and route spot independently on a book deep enough
+that the walk never binds, and the mutation fails all three with exact-equality evidence — identical
+numbers where there should be a difference, which is the signature of the blind spot itself.
+
+### v4 is deliberately untouched
+
+`UniswapV4BuyCallbackBase` still passes route spot as its reference and still has no cost guard.
+That is the v3-first build order, not an oversight, and it is the permissive direction: v4 quotes
+what it can source, it just does not yet refuse to source it into a manipulated book. D10 ports both
+halves and re-runs the grief suite against them. The one number that moved on v4 is the bisection
+change, which is venue-agnostic.

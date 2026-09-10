@@ -255,7 +255,14 @@ library SourcingMathLib {
         /// @dev Whether the parked position and the route venue are the same pool. When they are,
         /// burning `dL` thins the very book the residual is about to be sold into — finding A.
         bool routeIsParkVenue;
-        /// @dev Slippage budget, WAD. Cost is measured against the route venue's pre-trade spot.
+        /// @dev The maker's reference price, in the pair's canonical orientation. **Cost is
+        /// measured against this, not against the route venue's spot.** D7 is why: a front-run that
+        /// displaced route spot by 7.70bp — inside a 10bp budget — realised 61.34% below reference.
+        /// Valuing the residual at the venue it is about to be sold into prices the manipulation in
+        /// as if it were the market. It is also what keeps the quote and the settlement enforcing
+        /// one inequality: `onBuy` checks the same ratio against the same reference.
+        uint160 refSqrtPriceX96;
+        /// @dev Slippage budget, WAD. Cost is measured against `refSqrtPriceX96`.
         uint256 maxSlippageWad;
     }
 
@@ -414,23 +421,21 @@ library SourcingMathLib {
         (uint256 got, bool priceable) = _routeOut(p, residual, dL);
         if (!priceable) return (0, 0);
 
-        uint256 atSpot = p.residualIsRouteToken0
-            ? quote0For1(residual, p.routeSqrtPriceX96)
-            : quote1For0(residual, p.routeSqrtPriceX96);
+        uint256 atRef = valueAtRef(residual, p.refSqrtPriceX96, p.residualIsRouteToken0);
 
         // A residual too small to price at all is below the model's resolution, and quoting it as
         // free is how a bisection ends up returning dust. Not quotable.
-        if (atSpot == 0) return (0, 0);
+        if (atRef == 0) return (0, 0);
 
         sourced = direct + got;
-        cost = atSpot > got ? atSpot - got : 0;
+        cost = atRef > got ? atRef - got : 0;
 
         // The venue charges its fee whatever the arithmetic rounds to, so the modelled cost may
         // never come in under it. Without this floor the fee vanishes at small `dL` — and the fee
         // is precisely the term that is *proportional*, so a config whose route fee alone exceeds
         // the slippage budget has no honest bound at any size. Rounding it away turns that "zero"
         // into a spurious dust quote.
-        uint256 feeFloor = FullMath.mulDivRoundingUp(atSpot, p.routeFeePips, 1e6);
+        uint256 feeFloor = FullMath.mulDivRoundingUp(atRef, p.routeFeePips, 1e6);
         if (cost < feeFloor) cost = feeFloor;
     }
 
@@ -443,19 +448,29 @@ library SourcingMathLib {
         return share < p.liquidity ? uint128(share) : p.liquidity;
     }
 
-    /// @notice Largest amount of loan token the position can source with unwind cost inside
+    /// @notice Largest fill this callback will actually honour with unwind cost inside
     /// `maxSlippageWad`.
     ///
     /// @dev The answer `buyerAssetsBound` exists to give, and the reason it is an `external view`:
-    /// this bisects, up to 128 times, and over `eth_call` that is free. Executing on the taker's
-    /// gas could never afford it — model in the view, execute in the callback.
+    /// this bisects, and over `eth_call` that is free. Executing on the taker's gas could never
+    /// afford it — model in the view, execute in the callback.
     ///
-    /// @dev `sourcedFor` is increasing and its cost ratio is increasing in `dL` inside the cap, so
-    /// the predicate flips once and bisection finds the flip. The one wrinkle is at the very
-    /// bottom: a `dL` small enough that the residual rounds away is not quotable, so the predicate
-    /// is false-then-true-then-false rather than monotone. That costs nothing — `lo` only ever
-    /// advances on a *true*, so the search either finds the upper boundary or returns 0.
-    /// Under-reporting is the safe direction for a bound; over-reporting is not.
+    /// @dev **D8 moved the search from liquidity to fill size, and that is a correctness fix rather
+    /// than a refactor.** Bisecting on `dL` answered "what is the most this position can source
+    /// inside the budget", which is not the same question as "what is the largest fill the callback
+    /// will settle" — because `onBuy` does not burn the `dL` the model chose. It sizes the burn from
+    /// the *fill* through `liquidityForTarget`, which adds `IMPACT_MARGIN_BPS`. On a deep venue that
+    /// margin is clamped away by the available liquidity and the two agree to the wei; on a thin
+    /// route venue it inflates the burn, sells a larger residual into a book that is nearly spent,
+    /// and costs more than the quote promised. Measured before the fix: a fill at exactly the quoted
+    /// bound realised 16.93bp against a 10bp budget. Sizing the burn here exactly the way the
+    /// executor will closes it, and costs fewer iterations than the old search, not more.
+    ///
+    /// @dev Under-promising is the safe direction and this leans that way deliberately: a fill whose
+    /// sized burn comes up short is refused rather than modelled through the escalation path, even
+    /// though `onBuy` would escalate and might well settle it. A bound that is slightly small costs
+    /// the maker some idle capital; a bound that is slightly large hands the taker a reverted
+    /// transaction, which is the failure this whole layer exists to prevent.
     ///
     /// @dev The dust floor is load-bearing rather than tidy. Before `sourcedFor` refused it, a
     /// `dL` whose residual rounded to zero priced as *free* and passed any budget, so a maker whose
@@ -463,26 +478,79 @@ library SourcingMathLib {
     /// size — got a bound of **1 wei** instead, and a fill of 1 wei then reverted. A bound that
     /// small is not merely useless, it is wrong in both directions at once.
     function boundBySlippage(BoundParams memory p) internal pure returns (uint256) {
-        uint128 hi = maxBurnableLiquidity(p);
-        if (hi == 0) return 0;
+        uint128 maxBurn = maxBurnableLiquidity(p);
+        if (maxBurn == 0) return 0;
 
-        // The common case on a deep venue: the whole position is within budget, no search needed.
-        if (_withinBudget(p, hi)) {
-            (uint256 sourced,) = sourcedFor(p, hi);
-            return sourced;
-        }
+        // The ceiling on any fill: the *paper* value of everything the active-share cap allows
+        // burning, both legs valued at the reference. Deliberately not `sourcedFor(maxBurn)`, which
+        // is the intuitive choice and is wrong — it returns zero exactly when the route book cannot
+        // absorb the whole position's residual, which is the thin-venue case this search exists to
+        // handle, and bailing on it would quote nothing on every venue D6 was written for. Paper
+        // value needs no swap priced, always exceeds any honourable fill because real proceeds are
+        // never better than the reference, and so is a safe top of the search.
+        (uint256 amount0, uint256 amount1) =
+            amountsForLiquidity(p.sqrtPriceX96, p.sqrtLowerX96, p.sqrtUpperX96, maxBurn);
+        (uint256 direct, uint256 residual) = p.loanIsToken0 ? (amount0, amount1) : (amount1, amount0);
 
-        uint128 lo = 0;
+        uint256 ceiling = direct + valueAtRef(residual, p.refSqrtPriceX96, p.residualIsRouteToken0);
+        if (ceiling == 0) return 0;
+
+        uint256 lo = 0;
+        uint256 hi = ceiling;
         while (hi - lo > 1) {
-            uint128 mid = lo + (hi - lo) / 2;
-            if (_withinBudget(p, mid)) lo = mid;
+            uint256 mid = lo + (hi - lo) / 2;
+            if (_honours(p, maxBurn, mid)) lo = mid;
             else hi = mid;
         }
 
-        if (lo == 0) return 0;
+        return lo;
+    }
 
-        (uint256 sourcedAtLo,) = sourcedFor(p, lo);
-        return sourcedAtLo;
+    /// @dev Whether `onBuy` would settle a fill of `fill` inside the budget — sizing the burn the
+    /// way the executor sizes it, following it through the escalation the executor would take, and
+    /// pricing what that really sources and costs.
+    ///
+    /// @dev **The escalation has to be modelled, not treated as unreachable.** `liquidityForTarget`
+    /// prices the residual at park spot net of the route fee and nothing else, so on a thin route
+    /// venue the sized burn predictably comes up short and `onBuy` burns up to `escalationCeiling`
+    /// to finish the fill. Refusing to quote those fills is safe but expensive: it halved the bound
+    /// on the thin v4 venue in testing, which is a maker's capital sitting idle because the quote
+    /// would not admit to behaviour the callback actually has. The escalated burn is then priced on
+    /// its own terms — it sells a larger residual and usually costs more, and the budget check
+    /// below is what decides whether that is still acceptable.
+    ///
+    /// @dev Modelled as one combined burn-and-sell rather than two sequential ones, which is what
+    /// the price walk makes it: the second swap starts where the first left the route venue, so the
+    /// pair of them traverse the same book as a single sale of the same total residual.
+    ///
+    /// @dev The predicate flips once over `fill` and bisection finds the flip. At the very bottom it
+    /// is false-then-true-then-false rather than monotone, because a fill small enough that its burn
+    /// rounds the residual away is not quotable. That costs nothing: `lo` only ever advances on a
+    /// *true*, so the search either finds the upper boundary or returns 0.
+    function _honours(BoundParams memory p, uint128 maxBurn, uint256 fill) private pure returns (bool) {
+        if (fill == 0) return false;
+
+        uint128 dL = liquidityForTarget(
+            p.sqrtPriceX96, p.sqrtLowerX96, p.sqrtUpperX96, p.liquidity, p.loanIsToken0, fill, p.routeFeePips
+        );
+
+        // Above the active-share cap `sourcedFor` is non-monotone and the model is simply invalid,
+        // so a fill that needs a burn that large is not quotable — not merely expensive.
+        if (dL == 0 || dL > maxBurn) return false;
+
+        (uint256 sourced, uint256 cost) = sourcedFor(p, dL);
+
+        if (sourced < fill) {
+            uint256 escalated = escalationCeiling(dL, p.liquidity);
+            if (escalated <= dL || escalated > maxBurn) return false;
+
+            (sourced, cost) = sourcedFor(p, uint128(escalated));
+            if (sourced < fill) return false;
+        }
+
+        if (sourced == 0) return false;
+
+        return FullMath.mulDiv(cost, 1e18, sourced) <= p.maxSlippageWad;
     }
 
     /// @dev Whether burning out of the parked position thins the route venue — finding A. True only
@@ -538,12 +606,47 @@ library SourcingMathLib {
         return _thinsRoute(p) ? dL : 0;
     }
 
-    /// @dev Whether burning `dL` keeps the unwind inside the slippage budget.
-    function _withinBudget(BoundParams memory p, uint128 dL) private pure returns (bool) {
-        (uint256 sourced, uint256 cost) = sourcedFor(p, dL);
-        if (sourced == 0) return false;
+    /// @notice What a residual is worth in loan token at the maker's reference price.
+    /// @param residual How much of the residual token is being sold.
+    /// @param refSqrtPriceX96 The reference price, in the pair's canonical orientation.
+    /// @param residualIsToken0 Whether the residual is the pair's token0.
+    function valueAtRef(uint256 residual, uint160 refSqrtPriceX96, bool residualIsToken0)
+        internal
+        pure
+        returns (uint256)
+    {
+        return residualIsToken0 ? quote0For1(residual, refSqrtPriceX96) : quote1For0(residual, refSqrtPriceX96);
+    }
 
-        return FullMath.mulDiv(cost, 1e18, sourced) <= p.maxSlippageWad;
+    /// @notice What an unwind cost, as a WAD fraction of what it sourced.
+    ///
+    /// @dev **The D8 guard, and the denominator is the whole design.** This is deliberately the
+    /// same inequality `_withinBudget` uses to build the bound — cost over *sourced*, not cost over
+    /// the residual leg. The residual is roughly half of what a balanced position pays out, so
+    /// measuring the swap's execution against the residual alone would make settlement about twice
+    /// as strict as the quote, and a bound that promises fills the callback then refuses is a bound
+    /// that over-promises. Quote and execution have to enforce one inequality or neither is
+    /// trustworthy.
+    ///
+    /// @dev **And it is measured on the amount actually received, not on the route venue's spot.**
+    /// D7 measured a front-run that displaced route spot by 7.70bp, comfortably inside a 10bp
+    /// budget, while the price the residual realised deviated by 61.34% and took 61.86% of the fill
+    /// out of the maker's position. Spot proximity says nothing about execution quality on a book
+    /// the attacker has just eaten, and the residual is itself over-sized because the shortfall
+    /// forced an escalation.
+    ///
+    /// @param referenceValue What the residual sold was worth at `PRICE_REF`.
+    /// @param proceeds What the route venue actually paid for it.
+    /// @param sourced Total loan token the unwind produced, both legs.
+    function costWad(uint256 referenceValue, uint256 proceeds, uint256 sourced) internal pure returns (uint256) {
+        if (referenceValue <= proceeds) return 0;
+
+        // Nothing sourced and something lost is unbounded cost, not free. Reached only if a burn
+        // produces a residual and no loan token at all; the caller's `InsufficientSourced` check
+        // fires first for any non-zero fill, so this is a guard against the ratio, not a live path.
+        if (sourced == 0) return type(uint256).max;
+
+        return FullMath.mulDiv(referenceValue - proceeds, 1e18, sourced);
     }
 
     /// @notice Value of `amount1` of token1, denominated in token0, at `sqrtPriceX96`.

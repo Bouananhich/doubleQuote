@@ -47,18 +47,11 @@ import {TickBookLib} from "./libraries/TickBookLib.sol";
 /// defence is to not swap at all when the buffer covers it, and to swap as little as possible when
 /// it does not.
 ///
-/// @dev **Knowingly incomplete in one way still.** The residual swap runs with **no price
-/// protection at all** — no `minOut`, and a sqrt-price limit set to the extremes. `PRICE_REF` and
-/// `MAX_SLIPPAGE_WAD` are held as immutables here and not yet read.
-///
-/// @dev D7 measured what that costs, in `test/SandwichV3.t.sol`: sandwiching a 5,000 USDC fill on a
-/// route venue an attacker can afford to move takes **61.86% of the fill** out of the maker's
-/// position. The maker pays in *liquidity* rather than in price — `_sourceLoanToken` must deliver
-/// the shortfall or revert, so a residual that fetches less does not settle for less, it escalates
-/// the burn until the loan is covered, and lands on exactly the ceiling. D8 derives a `minOut` from
-/// `PRICE_REF` and checks the swap's actual output against it. Comparing the route pool's `slot0`
-/// to the reference instead would not work: the front-run displaces spot by 7.70bp, inside a 10bp
-/// budget, while the realised price deviates by 61.34%.
+/// @dev **The residual swap is guarded against the maker's own reference.** `PRICE_REF` prices the
+/// residual, `MAX_SLIPPAGE_WAD` says how far below that the maker will accept, and the check is on
+/// the amount actually received — not on the route pool's spot price, and not through a sqrt-price
+/// limit. D7 established why: an attack that displaced route spot by only 7.70bp, inside a 10bp
+/// budget, realised 61.34% below reference and took 61.86% of the fill out of the maker's position.
 ///
 /// @dev **The two halves are modelled differently, on purpose.** `buyerAssetsBound` simulates the
 /// whole unwind and bisects for the largest honest fill — it is a `view`, so it can. The burn
@@ -79,6 +72,15 @@ contract UniswapV3BuyCallback is UniswapBuyCallbackBase, IUniswapV3BuyCallback, 
         uint128 liquidity;
         uint128 owed0;
         uint128 owed1;
+    }
+
+    /// @dev Running totals for the residual sales one settlement makes: what they were worth at
+    /// `PRICE_REF`, and what the route venue paid. Carried as a memory struct so the sized burn's
+    /// swap and the escalation's both report into one place, and the budget is then checked over
+    /// the settlement rather than over whichever swap happened last.
+    struct Sale {
+        uint256 referenceValue;
+        uint256 proceeds;
     }
 
     /// @inheritdoc IUniswapV3BuyCallback
@@ -130,9 +132,13 @@ contract UniswapV3BuyCallback is UniswapBuyCallbackBase, IUniswapV3BuyCallback, 
 
         uint256 heldBefore = IERC20Extended(loanToken).balanceOf(address(this));
 
+        // Accumulated across both swaps: what the residual was worth at `PRICE_REF`, and what the
+        // route venue actually paid for it. Their difference is the cost the budget caps.
+        Sale memory sale;
+
         uint128 burn = _liquidityForShortfall(position, loanToken == position.token0, shortfall);
         _unwind(tokenId, burn);
-        _swapWholeResidual(residualToken, loanToken);
+        _swapWholeResidual(residualToken, loanToken, sale);
 
         uint256 sourced = IERC20Extended(loanToken).balanceOf(address(this)) - heldBefore;
 
@@ -149,7 +155,7 @@ contract UniswapV3BuyCallback is UniswapBuyCallbackBase, IUniswapV3BuyCallback, 
         uint256 ceiling = SourcingMathLib.escalationCeiling(burn, position.liquidity);
         if (sourced < shortfall && ceiling > burn) {
             _unwind(tokenId, uint128(ceiling - burn));
-            _swapWholeResidual(residualToken, loanToken);
+            _swapWholeResidual(residualToken, loanToken, sale);
             sourced = IERC20Extended(loanToken).balanceOf(address(this)) - heldBefore;
         }
 
@@ -157,6 +163,14 @@ contract UniswapV3BuyCallback is UniswapBuyCallbackBase, IUniswapV3BuyCallback, 
         // a bare `transferFrom` failure — worth two warm balance reads in the contract whose whole
         // point is failing honestly rather than filling badly.
         require(sourced >= shortfall, InsufficientSourced());
+
+        // **The D8 guard.** Checked once, over both swaps, against the same cost-over-sourced ratio
+        // `buyerAssetsBound` bisects on. Checked *after* the escalation rather than between the two
+        // swaps: the maker's budget is a statement about what the unwind cost in total, and a first
+        // swap that came in expensive can still be settled honestly if the second is cheap. A
+        // revert here rolls back both burns, so nothing is spent finding that out.
+        uint256 cost = SourcingMathLib.costWad(sale.referenceValue, sale.proceeds, sourced);
+        require(cost <= MAX_SLIPPAGE_WAD, SourcingCostAboveBudget(cost, MAX_SLIPPAGE_WAD));
     }
 
     /// @dev How much of the position this fill needs. See `SourcingMathLib.liquidityForTarget` for
@@ -207,15 +221,21 @@ contract UniswapV3BuyCallback is UniswapBuyCallbackBase, IUniswapV3BuyCallback, 
 
     /// @dev Swaps the callback's whole residual balance, which also sweeps up anything an earlier
     /// fill left behind.
-    function _swapWholeResidual(address residualToken, address loanToken) internal {
+    function _swapWholeResidual(address residualToken, address loanToken, Sale memory sale) internal {
         uint256 residual = IERC20Extended(residualToken).balanceOf(address(this));
-        if (residual > 0) _swapResidual(residualToken, loanToken, residual);
+        if (residual > 0) _swapResidual(residualToken, loanToken, residual, sale);
     }
 
     /// @dev Swaps the entire residual rather than only what the fill needs. Any excess becomes
     /// buffer, which is exactly where surplus loan token wants to be, and it means no residual dust
     /// ever accumulates on the callback.
-    function _swapResidual(address residualToken, address loanToken, uint256 amountIn) internal {
+    ///
+    /// @dev The sqrt-price limit stays at the extremes on purpose. A price limit makes v3
+    /// *partially* fill and return quietly, which here surfaces as a shortfall, triggers the
+    /// escalation path, and burns more of the maker's position — the attack paying for itself
+    /// through a different door. The protection is the cost check in `_sourceLoanToken`, on the
+    /// loan token that actually arrived.
+    function _swapResidual(address residualToken, address loanToken, uint256 amountIn, Sale memory sale) internal {
         require(
             (residualToken == ROUTE_TOKEN0 && loanToken == ROUTE_TOKEN1)
                 || (residualToken == ROUTE_TOKEN1 && loanToken == ROUTE_TOKEN0),
@@ -223,17 +243,24 @@ contract UniswapV3BuyCallback is UniswapBuyCallbackBase, IUniswapV3BuyCallback, 
         );
         bool zeroForOne = residualToken == ROUTE_TOKEN0;
 
-        IUniswapV3Pool(ROUTE_POOL)
+        // Read before the swap. `PRICE_REF` is an immutable pointing at a venue this contract is
+        // not about to trade in, so nothing the swap does can move it — but reading it first also
+        // means a reference that cannot price the pair reverts before any liquidity has moved.
+        sale.referenceValue += SourcingMathLib.valueAtRef(
+            amountIn, PRICE_REF.refSqrtPriceX96(ROUTE_TOKEN0, ROUTE_TOKEN1), zeroForOne
+        );
+
+        (int256 amount0, int256 amount1) = IUniswapV3Pool(ROUTE_POOL)
             .swap(
                 address(this),
                 zeroForOne,
                 amountIn.toInt256(),
-                // No protection. D8 replaces this with a `minOut` derived from `PRICE_REF` and
-                // `MAX_SLIPPAGE_WAD`, checked on the amount actually received. D7 measured what an
-                // attacker extracts through it: 61.86% of the fill. See `test/SandwichV3.t.sol`.
                 zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1,
                 ""
             );
+
+        // The output side is negative — v3 signs deltas from the pool's perspective.
+        sale.proceeds += uint256(-(zeroForOne ? amount1 : amount0));
     }
 
     /// @dev The pool pulls payment through here. Guarded on `ROUTE_POOL`, which is immutable — so
@@ -287,6 +314,7 @@ contract UniswapV3BuyCallback is UniswapBuyCallbackBase, IUniswapV3BuyCallback, 
                 routeSqrtPriceX96: routeSqrtPriceX96,
                 routeLiquidity: IUniswapV3Pool(ROUTE_POOL).liquidity(),
                 routeFeePips: ROUTE_FEE,
+                refSqrtPriceX96: PRICE_REF.refSqrtPriceX96(ROUTE_TOKEN0, ROUTE_TOKEN1),
                 routeBook: TickBookLib.readBook(
                     routeTick,
                     IUniswapV3Pool(ROUTE_POOL).tickSpacing(),

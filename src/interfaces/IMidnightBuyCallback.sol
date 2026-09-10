@@ -30,6 +30,14 @@ interface IMidnightBuyCallback is IBuyCallback {
     error ZeroAddress();
     /// @notice The slippage budget exceeds `MAX_SLIPPAGE_CEILING_WAD`.
     error SlippageBudgetTooLarge();
+    /// @notice Thrown when the unwind cost more against `PRICE_REF` than `MAX_SLIPPAGE_WAD` allows.
+    /// @dev The D8 guard. Measured on the loan token *actually received* rather than on the route
+    /// venue's spot price, because D7 measured an attack that stayed inside the budget on spot while
+    /// costing the maker 61.86% of the fill. The ratio is cost over sourced — the same one
+    /// `buyerAssetsBound` bisects on, so the quote and the settlement enforce one inequality.
+    /// @dev Reverting here reverts the whole take, which is the intended outcome: an offer that
+    /// cannot be settled honestly must not be settled.
+    error SourcingCostAboveBudget(uint256 costWad, uint256 budgetWad);
 
     /// EVENTS ///
 

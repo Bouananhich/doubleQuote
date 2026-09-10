@@ -202,7 +202,40 @@ that framing was right, and the loss is 61.86% of the fill.)*
   market, ratifier and taker; `_routedCallback`/`_approve` moved down to `ParkedPositionBase`.
 
 **Next:** D8 — `V3TwapRef` and the reference-relative bound in `onBuy`, then re-run this suite with
-the assertions inverted.
+the assertions inverted. *(Done — the sandwich reverts and the attacker loses 2,998.04.)*
+
+## D8 — done
+
+`V3TwapRef` and a reference-relative cost guard in `onBuy`, live on v3. **191/191.**
+
+- **The D7 attack fails closed.** The sandwiched settlement reverts at **44.60% cost against the
+  maker's 10bp budget**; the maker's position, buffer and NFT are untouched, and the attacker who
+  took 2,995.19 USDC on D7 now ends **−2,998.04**. Asserted in both directions on one callback —
+  the honest fill of the same size on the same venue still settles.
+- **The reference is expensive to move, and that is the number the guard rests on.** 100,000 USDT
+  pushed through the pool `V3TwapRef` reads drags spot from tick 7 to **18,819**; the 30-minute mean
+  stays on **7 exactly** in-block, drifts to 27 after one Base block, and converges on 18,819 over a
+  full window.
+- **The guard is cost over *sourced*, on the loan token actually received.** Not a `minOut` on the
+  residual leg — that is twice as strict as the quote and would refuse fills `buyerAssetsBound` had
+  just promised. Not `slot0` versus reference either, per D7.
+- **The bisection moved from liquidity to fill size, which was a correctness fix.** `onBuy` sizes
+  its burn from the fill through `liquidityForTarget`, margin included, so the old bound promised
+  fills the executor would not honour: at exactly the quoted bound the thin venue realised 16.93bp
+  against 10bp. Deep-venue answer unchanged to the wei (**19,871.458852**); thin v3 venue
+  9,838.854693 → **9,817.764107**; v4 214.661289 → **214.128351**. Fewer iterations, not more.
+- **Escalation is now unreachable within any legal budget on these venues.** A 2,400 USDT drain
+  settles in one burn inside 10%; 2,500 costs 34.99%, and the budget ceiling is 10%. The mechanism
+  stays for venue shapes with gradual depth; its test now isolates it behind a neutralised stub
+  reference, and a paired test records the finding.
+- **New rule, kept deliberately:** the bound never promises more than the residual is worth at the
+  maker's own reference, even when the route venue would pay better.
+- Mutation-checked, and one mutation exposed a hole worth having found: swapping the reference back
+  for route spot — undoing the day's central change — failed one assertion by 0.9%, because the two
+  agree on a quiet fork. Two library tests now separate them explicitly.
+
+**Next:** D9 — the dust-take grief test, the minimum-fill-size decision, and **the oracle licensing
+question, which now has real oracle code attached to it**. The root `LICENSE` file is still missing.
 
 Build order is **v3 first, v4 second, both shipped**. v3 is load-bearing — its native
 `observe()` makes the price-reference work straightforward. If a day goes missing, v4 is cut,
@@ -252,7 +285,7 @@ The prep window (Mon 31 Aug → Thu 3 Sep) was not used. These are prerequisites
 
 | Day | Deliverable |
 |-----|-------------|
-| **D8** (Fri 11) | The fix on v3: reference-relative bound in `onBuy` behind `IPriceRef`, first implementation `V3TwapRef`. Same D7 test, now reverting cleanly or filling honestly. |
+| **D8** (Fri 11) | The fix on v3 ✅, a day early. `V3TwapRef` + a cost guard measured against it; the D7 sandwich reverts at 44.60% and the attacker ends **−2,998.04**. Also fixed a bound that promised fills the executor would not honour. |
 | **D9** (Sat 12) | Dust-take grief test — N repeated dust takes, bleed without the buffer, flat line with it. Also the decision point for a configured **minimum fill size**: deliberately skipped on D3 because the bleed is linear and the sourcing floor self-calibrates, so revisit only if the measured bleed contradicts that (see `JOURNAL.md`). **Resolve the oracle licensing question today**, before D10 depends on it. |
 | **D10** (Sun 13) | Port grief + fix to v4; add `TruncatedOracleRef` with a seeded oracle pool in-fork. Hook address mining. Run the D7 attack against both references. |
 | **D11** (Mon 14) | **The frontier chart** — sweep range width, plot fee APR against `buyerAssetsBound`. Plus gas benchmarks: v3 vs v4 vs `BlueBuyCallback`, buffer-hit and buffer-miss separately. |

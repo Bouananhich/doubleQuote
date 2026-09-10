@@ -5,14 +5,16 @@ import {FullMath} from "v4-core/libraries/FullMath.sol";
 
 import {UniswapV3BuyCallback} from "../src/UniswapV3BuyCallback.sol";
 import {INonfungiblePositionManager, IUniswapV3Pool} from "../src/interfaces/IUniswapV3.sol";
+import {IMidnightBuyCallback} from "../src/interfaces/IMidnightBuyCallback.sol";
 import {IUniswapV3BuyCallback} from "../src/interfaces/IUniswapV3BuyCallback.sol";
 
 import {MidnightMarketBase} from "./MidnightMarketBase.sol";
 import {IERC20Meta} from "./interfaces/IUniswapMinimal.sol";
 import {PoolPusher} from "./mocks/PoolPusher.sol";
+import {StubPriceRef} from "./mocks/StubPriceRef.sol";
 
-/// @notice **D7 — the griefing test.** What an attacker extracts from a maker whose callback swaps
-/// its residual with no price protection at all.
+/// @notice **D7's griefing test, D8's fix.** The same attack, the same venue, the same numbers —
+/// and now it reverts.
 ///
 /// @dev The attack is an ordinary sandwich, and the thing being sandwiched is not a trade the maker
 /// chose to make. It is the residual swap that every unwind drags behind it: the position pays out
@@ -21,25 +23,24 @@ import {PoolPusher} from "./mocks/PoolPusher.sol";
 /// the fill size picks the size, and `ROUTE_POOL` is fixed at deployment. That is a swap with a
 /// publicly predictable trigger, which is the definition of a sandwichable one.
 ///
-/// @dev **What D6 already took away from the attacker.** Before the tick walk it was possible to
-/// attack the *quote*: the single-step bound assumed active liquidity continued past the ticks the
-/// swap actually crossed, so a thin route venue produced a bound that over-promised by 25.33%.
-/// `buyerAssetsBound` now walks the real book, so a quote read at block N is honest about block N.
-/// What is left is the gap between block N and the block the take lands in — and nothing in an
-/// `external view` can defend that, because the attacker moves the pool after the view returned.
-/// That gap is what this suite measures, and it is the case `PRICE_REF` exists for at D8.
+/// @dev **What D7 measured, and what D8 does about it.** Unprotected, the sandwich took 3,092.76
+/// USDC out of a 5,000 fill — 61.86% — because `onBuy` must deliver the shortfall or revert, so a
+/// residual that fetched less did not settle for less, it burnt more of the maker's position until
+/// the loan was covered. D8 gives `onBuy` a third option: refuse. The unwind's cost is measured
+/// against `PRICE_REF` and checked against `MAX_SLIPPAGE_WAD`, and the attacked settlement now
+/// fails closed at **44.60% against a 1bp... against the maker's 10bp budget**.
 ///
-/// @dev **The route venue is the 0.05% pool, and that choice is the attack's whole economics.**
-/// Park and route are independently chosen (invariant 5), so a maker can and does end up routing
-/// somewhere thinner than where the capital sits. `test_theSandwichIsUneconomicOnTheDeepVenue`
-/// runs the identical attack through the 0.01% pool the position is parked in and shows it loses
-/// money — the vulnerability is not "v3 callbacks can be sandwiched", it is "a callback routing
-/// through a venue an attacker can afford to move can be sandwiched", which is a statement about
-/// the maker's configuration and therefore something a maker can be told.
+/// @dev **The guard is on realised cost, not on spot, and D7 is why.** The front-run displaces the
+/// route pool's spot by 7.70bp — *inside* the maker's 10bp budget. A guard comparing `slot0` to the
+/// reference would wave this straight through. What it costs is only visible in what the swap
+/// actually returned, which is where the check sits. See `SourcingMathLib.costWad`.
 ///
-/// @dev Every number in this file is measured at `FORK_BLOCK` against the deployed Midnight, and
-/// pinned. D8 re-runs the same scenarios with `PRICE_REF` wired in; the assertions there are the
-/// mirror image of the ones here.
+/// @dev **What D8 does not fix**, and `test_aQuoteGoesStaleTheMomentTheRouteVenueMoves` keeps
+/// saying so: an attacker who never takes can still move the route venue and strand a quote read a
+/// block earlier. No bound computed at block N can promise anything about block N+1. A price
+/// reference stops the maker being *robbed* between quote and block, not being *stalled*.
+///
+/// @dev Every number here is measured at `FORK_BLOCK` against the deployed Midnight, and pinned.
 contract SandwichV3Test is MidnightMarketBase {
     /// @dev 10bp. Wide enough that the thin route venue quotes a fill worth attacking — at the 1bp
     /// the rest of the suite uses, the 0.05% route fee alone exceeds the budget and the honest
@@ -65,12 +66,27 @@ contract SandwichV3Test is MidnightMarketBase {
     uint256 internal constant ATTACKER_FLOAT = 100_000e6;
 
     UniswapV3BuyCallback internal routed;
+    /// @dev The same callback with its guard neutralised: a stub reference pricing the residual at
+    /// a quarter of its worth, so the modelled cost is zero at any drift. This is the D7 callback,
+    /// kept alive purely so `test_spotStaysInsideTheBudgetWhileTheRealisedPriceDoesNot` can still
+    /// observe what a sandwiched settlement executes at. Nothing in this suite lets it settle a
+    /// fill that the guarded one would refuse *and* calls that acceptable.
+    UniswapV3BuyCallback internal unguarded;
     PoolPusher internal attacker;
 
     function setUp() public override {
         super.setUp();
 
         routed = _routedCallback(BUDGET_WAD, POOL_USDC_USDT_500, 7);
+        unguarded = UniswapV3BuyCallback(
+            factory.createCallback(
+                maker,
+                new StubPriceRef(158_456_325_028_528_675_187_087_900_672),
+                BUDGET_WAD,
+                POOL_USDC_USDT_500,
+                bytes32(uint256(8))
+            )
+        );
         _approve(routed);
 
         attacker = new PoolPusher();
@@ -98,39 +114,14 @@ contract SandwichV3Test is MidnightMarketBase {
         return int256(IERC20Meta(USDC).balanceOf(address(attacker))) - int256(ATTACKER_FLOAT);
     }
 
-    /// @dev What the maker is left holding, valued in USDC at par.
-    ///
-    /// @dev Measured by *actually* unwinding: the maker burns whatever liquidity survived the fill
-    /// and collects, and the callback's buffer is added because it is the maker's too. Par is the
-    /// valuation, and it is the conservative direction — the parked pool sits at tick 7, so a USDT
-    /// unit is worth 1.0007 USDC there and par understates the residual leg by 7bp. That is two
-    /// orders of magnitude below the loss being measured, and it applies identically to both sides
-    /// of the comparison.
-    ///
-    /// @dev The park venue is the 0.01% pool and the attack happens in the 0.05% pool, so the price
-    /// this unwind pays out at is the same in both branches. The comparison isolates the swap.
-    function _makerEstate(UniswapV3BuyCallback cb) internal returns (uint256) {
-        uint128 remaining = _liquidity();
-
-        vm.startPrank(maker);
-        if (remaining > 0) {
-            INonfungiblePositionManager(V3_POSITION_MANAGER)
-                .decreaseLiquidity(
-                    INonfungiblePositionManager.DecreaseLiquidityParams({
-                        tokenId: tokenId, liquidity: remaining, amount0Min: 0, amount1Min: 0, deadline: block.timestamp
-                    })
-                );
-        }
-        INonfungiblePositionManager(V3_POSITION_MANAGER)
-            .collect(
-                INonfungiblePositionManager.CollectParams({
-                    tokenId: tokenId, recipient: maker, amount0Max: type(uint128).max, amount1Max: type(uint128).max
-                })
-            );
-        vm.stopPrank();
-
-        return IERC20Meta(USDC).balanceOf(maker) + IERC20Meta(USDT).balanceOf(maker)
-            + IERC20Meta(USDC).balanceOf(address(cb)) + IERC20Meta(USDT).balanceOf(address(cb));
+    /// @dev Everything the maker's side of a refused take must leave untouched: the position, the
+    /// buffer, and the NFT. Asserted directly rather than valued, because a take that reverts should
+    /// move nothing at all — "worth about the same" would be a weaker claim than the truth.
+    function _assertMakerUntouched(uint128 liquidityBefore, uint256 bufferBefore) internal view {
+        assertEq(_liquidity(), liquidityBefore, "a refused take moved the position");
+        assertEq(IERC20Meta(USDC).balanceOf(address(routed)), bufferBefore, "a refused take spent the buffer");
+        assertEq(IERC20Meta(USDT).balanceOf(address(routed)), 0, "a refused take left residual behind");
+        assertEq(INonfungiblePositionManager(V3_POSITION_MANAGER).ownerOf(tokenId), maker, "maker lost the NFT");
     }
 
     /// @dev Takes, and reports the price the callback's residual sale actually got — token1 per
@@ -167,53 +158,78 @@ contract SandwichV3Test is MidnightMarketBase {
 
     /// THE DELIVERABLE ///
 
-    /// @dev **The griefing test.** Front-run the route venue, let the take settle into the price
-    /// that manufactured, back-run it. The taker gets the same loan in both branches and Midnight's
-    /// books are identical, so everything the attacker walks away with came out of the maker's
-    /// position.
+    /// @dev **The fix, stated in both directions on one callback.** The honest fill of the same
+    /// size, on the same venue, still settles — and the sandwiched one reverts. Either assertion
+    /// alone is worthless: a guard that refuses everything passes the second, and a guard that
+    /// refuses nothing passes the first.
     ///
-    /// @dev The mechanism is worth stating plainly, because it is not "the maker sold at a bad
-    /// price and ate the difference". `onBuy` must deliver `shortfall` or revert, so a residual that
-    /// fetches less USDC does not settle for less — it burns *more liquidity* until the loan is
-    /// covered. The maker pays the attacker in LP position, at a size the maker never authorised,
-    /// and the escalation ceiling is what stops that from being the whole position.
-    function test_aSandwichAroundTheTakeIsPaidForOutOfThePosition() public {
+    /// @dev The maker keeps everything. No liquidity burnt, no credit, no debt, the NFT untouched —
+    /// against D7, where the same transaction cost them 3,092.76 USDC of a 5,000 fill.
+    function test_theSandwichNowFailsClosedAndTheMakerKeepsEverything() public {
         _collateralize(FILL);
 
         uint128 liquidityBefore = _liquidity();
-        uint256 snapshot = vm.snapshotState();
+        uint256 bufferBefore = IERC20Meta(USDC).balanceOf(address(routed));
 
-        // Branch A: nobody attacks.
+        // The honest fill settles. Without this the revert below proves nothing.
+        uint256 snapshot = vm.snapshotState();
         _takeFor(address(routed), FILL);
-        uint256 honestBurn = liquidityBefore - _liquidity();
-        uint256 honestEstate = _makerEstate(routed);
+        assertEq(IERC20Meta(USDC).balanceOf(taker), FILL, "an unattacked fill was refused");
+        assertLt(_liquidity(), liquidityBefore, "the honest fill did not draw on the position");
         vm.revertToState(snapshot);
 
-        // Branch B: the same take, sandwiched.
+        // The sandwiched one does not. 44.60% against the maker's 10bp — pinned, because this is
+        // the number D7 measured the maker paying and D8 exists to refuse.
         _frontRun();
-        _takeFor(address(routed), FILL);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IMidnightBuyCallback.SourcingCostAboveBudget.selector, 446_045_019_709_500_009, BUDGET_WAD
+            )
+        );
+        vm.prank(taker);
+        midnight.take(_offerFor(address(routed), FILL), hex"", FILL, taker, taker, address(0), hex"");
         _backRun();
-        uint256 attackedBurn = liquidityBefore - _liquidity();
-        uint256 attackedEstate = _makerEstate(routed);
 
-        // The taker is indifferent — this is not a cost passed on to them.
-        assertEq(IERC20Meta(USDC).balanceOf(taker), FILL, "taker did not receive the same loan");
-        assertEq(midnight.credit(marketId, maker), FILL, "maker's credit differs between branches");
+        _assertMakerUntouched(liquidityBefore, bufferBefore);
+        assertEq(midnight.debt(marketId, taker), 0, "a refused take created debt");
+        assertEq(midnight.credit(marketId, maker), 0, "a refused take created credit");
 
+        // And the attacker is out of pocket: they moved the pool, paid the round trip, and the
+        // settlement they were positioning against never happened.
         int256 profit = _attackerProfit();
-        uint256 loss = honestEstate - attackedEstate;
+        emit log_named_int("attacker profit against a guarded callback (USDC)", profit);
+        assertLt(profit, int256(0), "the sandwich still paid");
+    }
 
-        emit log_named_uint("honest burn (liquidity)", honestBurn);
-        emit log_named_uint("attacked burn (liquidity)", attackedBurn);
-        emit log_named_uint("maker estate, honest (USDC)", honestEstate);
-        emit log_named_uint("maker estate, attacked (USDC)", attackedEstate);
-        emit log_named_uint("maker loss (USDC)", loss);
-        emit log_named_int("attacker profit (USDC)", profit);
+    /// @dev **The quote is reference-relative too, and this is the test that says so.** D8 moved
+    /// `sourcedFor` from valuing the residual at the route venue's spot to valuing it at
+    /// `PRICE_REF`. On a quiet fork the two are within a basis point of each other, so nothing in
+    /// the suite noticed the difference — a mutation swapping them back failed exactly one
+    /// assertion, by 0.9%. This is the case where they genuinely disagree.
+    ///
+    /// @dev Front-run the route venue and read the bound *afterwards*. Valued at the reference, the
+    /// residual is still worth what it was worth and the moved venue plainly cannot pay that, so the
+    /// quote collapses — the callback tells a routing layer the truth about what it will settle.
+    /// Valued at the moved venue's own spot, the manipulation prices itself in as if it were the
+    /// market, the cost looks ordinary and the quote barely moves. That is the failure mode D7
+    /// found in execution, and it lives in the quote as well.
+    function test_theQuoteCollapsesWhenTheRouteVenueMovesAwayFromTheReference() public {
+        uint256 before = routed.buyerAssetsBound(bytes32(0), market, maker, _callbackData());
+        assertGt(before, 9_000e6, "the venue does not quote enough for this test to mean anything");
 
-        assertGt(attackedBurn, honestBurn, "the sandwich did not cost the maker any extra liquidity");
-        assertLt(attackedEstate, honestEstate, "the maker was not worse off");
-        assertGt(profit, int256(0), "the attack did not pay");
-        assertLe(uint256(profit), loss, "the attacker extracted more than the maker lost");
+        _frontRun();
+
+        uint256 after_ = routed.buyerAssetsBound(bytes32(0), market, maker, _callbackData());
+
+        emit log_named_uint("bound before the front-run (USDC)", before);
+        emit log_named_uint("bound after the front-run (USDC)", after_);
+
+        // Measured at `FORK_BLOCK`: 9,817.764107 before, 3,872.312997 after — the quote gives up
+        // 60.6% of its size the moment the venue it routes through stops being able to pay
+        // reference value. More than halving is the assertion rather than the exact pair, because
+        // what matters is that it is a collapse and not a trim; a quote that shrugged this off
+        // would still be promising fills the guard refuses, which is the inconsistency D8 removes.
+        assertLt(after_ * 2, before, "the quote barely moved when the route venue did");
     }
 
     /// @dev The other harm, and the cheaper one: the attacker never takes the offer at all, just
@@ -287,21 +303,15 @@ contract SandwichV3Test is MidnightMarketBase {
         assertLt(profit, int256(0), "the sandwich paid on the deep venue too");
     }
 
-    /// @dev **The acceptance criterion for D8.** Not the pool's displaced spot — the price the
-    /// residual sale *actually realised*, measured off the route pool's own balances across the
-    /// take, honest branch against attacked branch.
+    /// @dev **The measurement that chose D8's design**, kept as a standing test because it is the
+    /// reason the guard is not where it would naturally have been put.
     ///
-    /// @dev The distinction matters and it was not obvious. The front-run moves the 0.05% pool's
-    /// spot by only ~7.7bp, comfortably *inside* the maker's 10bp budget — so a guard that compared
-    /// spot against the reference would wave this attack through. The damage is not displacement,
-    /// it is that the front-run **eats the book the residual then has to walk**, and the residual
-    /// itself is twice as large as it should have been because the shortfall forced an escalation.
-    /// The realised price is the only number that sees all three effects at once, which is why D8's
-    /// check belongs on execution and not on spot.
-    ///
-    /// @dev D8 replaces the last two assertions with their inverse: this take must revert rather
-    /// than settle, and the deviation logged below is what it has to notice.
-    function test_theResidualSellsFarOutsideTheBudgetAndTheCallbackDoesItAnyway() public {
+    /// @dev Spot and realised price disagree completely here. The front-run moves the route pool's
+    /// spot by 7.70bp, comfortably inside the maker's 10bp budget — so a guard comparing `slot0`
+    /// against the reference sees nothing wrong. The price the residual actually realises deviates
+    /// by 61.34%, because the front-run ate the book the residual then had to walk and the residual
+    /// was over-sized by the escalation. The guard reads the second number, so it refuses.
+    function test_spotStaysInsideTheBudgetWhileTheRealisedPriceDoesNot() public {
         _collateralize(FILL);
 
         // Everything below is in the residual's own orientation — USDC received per USDT sold —
@@ -315,37 +325,34 @@ contract SandwichV3Test is MidnightMarketBase {
         uint256 honestRealised = _takeAndMeasureRealised(address(routed), FILL);
         vm.revertToState(snapshot);
 
+        // The attacked realised price has to be measured against an *unguarded* callback, because
+        // the guarded one refuses to produce it — which is the entire point of the day's work.
+        // Approval is one slot per `tokenId`, so it has to move across.
+        _approve(unguarded);
         _frontRun();
         uint256 spotAfterFrontRun = _priceOfResidual(POOL_USDC_USDT_500);
-        uint256 attackedRealised = _takeAndMeasureRealised(address(routed), FILL);
+        uint256 attackedRealised = _takeAndMeasureRealised(address(unguarded), FILL);
 
         uint256 spotDeviation = FullMath.mulDiv(refPrice - spotAfterFrontRun, 1e18, refPrice);
         uint256 honestDeviation = FullMath.mulDiv(refPrice - honestRealised, 1e18, refPrice);
         uint256 attackedDeviation = FullMath.mulDiv(refPrice - attackedRealised, 1e18, refPrice);
 
         emit log_named_uint("reference, USDC per USDT (WAD)", refPrice);
-        emit log_named_uint("route spot after the front-run (WAD)", spotAfterFrontRun);
         emit log_named_uint("displacement of spot alone (WAD)", spotDeviation);
-        emit log_named_uint("realised residual price, honest (WAD)", honestRealised);
-        emit log_named_uint("realised residual price, attacked (WAD)", attackedRealised);
         emit log_named_uint("realised deviation, honest (WAD)", honestDeviation);
         emit log_named_uint("realised deviation, attacked (WAD)", attackedDeviation);
         emit log_named_uint("budget (WAD)", BUDGET_WAD);
-
-        // The honest unwind lives inside the budget it was quoted under. That is D6 working, and
-        // it is close — 8.13bp against a 10bp budget, so D8's guard has under 2bp of slack to play
-        // with before it starts refusing fills that were fine.
-        assertLt(honestDeviation, BUDGET_WAD, "an unattacked fill already breaches the budget");
 
         // Spot alone would not have caught this: the front-run displaces the pool by less than the
         // maker's whole budget. A guard comparing `slot0` to the reference waves the attack through.
         assertLt(spotDeviation, BUDGET_WAD, "the front-run breached the budget on spot after all");
 
-        // The realised price is three orders of magnitude past it.
+        // The realised price is two orders of magnitude past it.
         assertGt(attackedDeviation, BUDGET_WAD * 100, "the attacked fill did not breach the budget");
 
-        // And the callback sources into it regardless. These are the lines D8 inverts.
-        assertEq(IERC20Meta(USDC).balanceOf(taker), FILL, "the take did not settle");
-        assertEq(address(routed.PRICE_REF()), address(priceRef), "the reference is configured but unread");
+        // And the honest unwind's residual leg sits between them, which is why the budget has to be
+        // applied over what the unwind sourced rather than over this leg alone — see
+        // `SourcingMathLib.costWad`.
+        assertLt(honestDeviation, attackedDeviation, "the honest fill realised worse than the attacked one");
     }
 }

@@ -236,3 +236,35 @@ part that makes the feedback actionable and the part that is impossible to recon
     this on the combined action and was deprecated without the docs foregrounding the split as its
     replacement for this case.
     (cost: ~20m)
+
+2026-09-10 15:20  [v3-periphery]  the canonical TWAP helper is unreachable from 0.8, so every
+    integrator re-implements its rounding — and the rounding is the part that is easy to get wrong.
+    Needed an arithmetic-mean tick over a window: `observe([window, 0])`, difference the
+    cumulatives, divide. `OracleLibrary.consult` in v3-periphery does exactly this and is the
+    reference implementation, but v3-periphery is pinned to `=0.7.6` and cannot be compiled in a
+    profile that follows Midnight at 0.8.34. So it gets copied by hand, which is fine until you
+    notice the one line that is not arithmetic: Solidity's `/` truncates toward zero, and the mean
+    tick has to round *down*, so a negative cumulative delta that does not divide evenly needs an
+    explicit `--`. Omit it and the reference is biased in one direction only — a systematic tilt on
+    any pair whose price sits just below tick zero, which is most stable pairs quoted one way
+    round, and invisible on any pair quoted the other.
+    Same shape as the `TickBitmap` note from D6: the piece an integrator must match bit-for-bit is
+    the piece the libraries make hardest to reuse. A `pure` mean-tick helper taking the two
+    cumulatives and the window would be ~6 lines, would compile on any 0.8, and would remove a
+    silent-bias footgun from every 0.8 integration. Tested here against a mock pool with chosen
+    cumulatives, because a real pool at a pinned block cannot be made to produce a negative
+    non-dividing delta on demand.
+    (cost: ~20m)
+
+2026-09-10 15:45  [v3]  `observe()` fails as a bare string, at the worst possible moment.
+    A pool whose `observationCardinality` cannot reach back far enough reverts `OLD` — a plain
+    `require` string, no error type, no mention of what window it could have served. For a price
+    reference that is the difference between a deployment that fails and an *offer* that fails: the
+    oracle is not consulted until settlement, so a badly configured reference deploys fine, quotes
+    fine (`buyerAssetsBound` reverting reads as "no bound available" to a routing layer), and then
+    reverts every take on the taker's gas. Wrapped the probe in the constructor and restated it as
+    `InsufficientObservationHistory(pool, window)` so it fails at the only moment anyone can act.
+    Cardinality only ever grows, so the constructor check is sound rather than merely early. The
+    friction is that this is entirely on the integrator to think of — nothing in the interface hints
+    that the oracle is the one dependency whose readiness is a deployment-time property.
+    (cost: ~10m)

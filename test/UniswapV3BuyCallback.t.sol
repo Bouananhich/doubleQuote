@@ -14,6 +14,7 @@ import {IUniswapV3BuyCallback} from "../src/interfaces/IUniswapV3BuyCallback.sol
 import {ParkedPositionBase} from "./ParkedPositionBase.sol";
 import {IERC20Meta} from "./interfaces/IUniswapMinimal.sol";
 import {PoolPusher} from "./mocks/PoolPusher.sol";
+import {StubPriceRef} from "./mocks/StubPriceRef.sol";
 
 /// @notice D2: the v3 happy path, against a real position minted in the real USDC/USDT 0.01% pool
 /// on a Base fork.
@@ -198,13 +199,19 @@ contract UniswapV3BuyCallbackTest is ParkedPositionBase {
     /// @dev The burn lands on exactly the ceiling. Escalation does not re-derive a size, it goes
     /// straight to twice what the fill justified.
     function test_escalationFinishesAFillTheFirstBurnFellShortOf() public {
-        // Route through the 0.05% pool: same pair, ~50x thinner, and a venue this test can move
-        // without touching the price the sizing reads off the parked pool.
+        // **The reference is deliberately neutralised here.** After D8 the drift that makes the
+        // sized burn fall short is, on these venues, the same drift the cost guard refuses — the
+        // two thresholds coincide, so driving escalation through a real reference is impossible at
+        // any budget the constructor permits. See the paired test below, which is that finding.
+        // A stub reference that prices the residual at a quarter of its worth takes the guard out
+        // of the way entirely — the modelled cost is zero at any drift — so this test can still say
+        // what it is for: that the escalation mechanism works, that it lands on the ceiling, and
+        // that the ceiling holds. `2 * 2^96` is the square root of a price of 4.
+        StubPriceRef permissive = new StubPriceRef(158_456_325_028_528_675_187_087_900_672);
         UniswapV3BuyCallback drifted = UniswapV3BuyCallback(
-            factory.createCallback(maker, priceRef, MAX_SLIPPAGE_WAD, POOL_USDC_USDT_500, bytes32(uint256(3)))
+            factory.createCallback(maker, permissive, MAX_SLIPPAGE_WAD, POOL_USDC_USDT_500, bytes32(uint256(3)))
         );
-        vm.prank(maker);
-        INonfungiblePositionManager(V3_POSITION_MANAGER).approve(address(drifted), tokenId);
+        _approve(drifted);
 
         uint128 liquidityBefore = _liquidity();
 
@@ -234,6 +241,37 @@ contract UniswapV3BuyCallbackTest is ParkedPositionBase {
         // meaningful: had `2 * sized` run past the available liquidity, the ceiling would have
         // clamped to it and the burn would be `liquidityBefore`.
         assertGt(_liquidity(), 0, "escalation took the whole position");
+    }
+
+    /// @dev **The D8 finding the test above had to work around.** With a real reference, the same
+    /// drained venue and the same fill fail closed at **44.60%** against a 1bp budget — and the
+    /// constructor caps any budget at 10%, so *no* callback this factory can build would have
+    /// settled it. Escalation is not merely expensive here, it is unreachable.
+    ///
+    /// @dev That is not a coincidence, it is the book. `liquidityForTarget` covers the route fee
+    /// and a flat 25bp of impact, so the sized burn only falls short once impact exceeds 25bp — and
+    /// on a venue whose book above spot is a handful of ticks, the residual that costs 25bp and the
+    /// residual that costs tens of percent are almost the same trade. Bisected at `FORK_BLOCK`: a
+    /// 2,400 USDT drain still settles in one burn inside 10%, and 2,500 costs 34.99%. The escalation
+    /// path stays in the contract because a route venue with gradual depth rather than a cliff would
+    /// separate the two thresholds; on this pair it does not, and pretending otherwise in a test
+    /// would be inventing coverage.
+    function test_theCostGuardRefusesTheDriftThatWouldForceAnEscalation() public {
+        UniswapV3BuyCallback tight = _routedCallback(MAX_SLIPPAGE_WAD, POOL_USDC_USDT_500, 33);
+        _approve(tight);
+
+        uint128 liquidityBefore = _liquidity();
+        _drainRouteVenue(3_000e6);
+
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IMidnightBuyCallback.SourcingCostAboveBudget.selector, 446_045_019_709_500_009, MAX_SLIPPAGE_WAD
+            )
+        );
+        vm.prank(MIDNIGHT);
+        tight.onBuy(bytes32(0), market, 5_000e6, 0, 0, maker, _callbackData());
+
+        assertEq(_liquidity(), liquidityBefore, "a refused fill still moved the position");
     }
 
     /// @dev Sells USDT into the route pool, taking most of its USDC with it, so the residual the
@@ -352,7 +390,10 @@ contract UniswapV3BuyCallbackTest is ParkedPositionBase {
             .buyerAssetsBound(bytes32(0), market, maker, _callbackData());
 
         assertLt(boundThere, boundHere, "a thinner, dearer route venue did not cost the maker size");
-        assertEq(boundHere - boundThere, 10_032_604159, "the gap between the two venues moved");
+        // `boundHere` is unchanged at 19,871.458852 across D8 — the deep venue clamps the impact
+        // margin away, so modelling the executor's sizing changes nothing there. The gap moved by
+        // exactly the 21.09 the thin venue lost.
+        assertEq(boundHere - boundThere, 10_053_694745, "the gap between the two venues moved");
     }
 
     /// @dev **The D6 deliverable, on the config that made the case for it.** Routing this position
@@ -374,7 +415,11 @@ contract UniswapV3BuyCallbackTest is ParkedPositionBase {
         UniswapV3BuyCallback elsewhere = _routedCallback(0.001e18, POOL_USDC_USDT_500, 25);
         uint256 bound = elsewhere.buyerAssetsBound(bytes32(0), market, maker, _callbackData());
 
-        assertEq(bound, 9_838_854693, "the quoted bound moved");
+        // D6 quoted 9,838.854693 here. D8 moved the bisection from liquidity to fill size, so the
+        // quote now sizes the burn through `liquidityForTarget` exactly as `onBuy` will — including
+        // its 25bp impact margin, which on this venue is not clamped away by available liquidity.
+        // The 21.09 USDC difference is that margin being told the truth about.
+        assertEq(bound, 9_817_764107, "the quoted bound moved");
 
         // What the single step used to quote here, and what it did when asked to honour it.
         _approve(elsewhere);
@@ -435,9 +480,20 @@ contract UniswapV3BuyCallbackTest is ParkedPositionBase {
         assertGt(atFiveBp, 0, "the tighter budget quoted nothing at all");
         assertLt(atFiveBp, atTenBp, "widening the budget did not raise the quote");
 
+        // **D8 changed what happens next, and for the better.** Before the guard, half again the
+        // quoted bound simply settled — the position had the capacity, so the budget was a number
+        // in a view that `onBuy` never consulted. That is exactly the gap D7 walked through. Now
+        // the budget is enforced where it matters, and the same fill fails closed.
         _approve(tight);
+        vm.expectPartialRevert(IMidnightBuyCallback.SourcingCostAboveBudget.selector);
         vm.prank(MIDNIGHT);
         tight.onBuy(bytes32(0), market, atFiveBp + atFiveBp / 2, 0, 0, maker, _callbackData());
+
+        // And the quoted size itself still settles, so the refusal above is the budget binding
+        // rather than the venue running out. That pairing is the whole claim.
+        _approve(tight);
+        vm.prank(MIDNIGHT);
+        tight.onBuy(bytes32(0), market, atFiveBp, 0, 0, maker, _callbackData());
     }
 
     function test_buyerAssetsBoundIncludesTheBuffer() public {

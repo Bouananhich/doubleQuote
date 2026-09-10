@@ -7,7 +7,7 @@ import {INonfungiblePositionManager, IUniswapV3Pool} from "../src/interfaces/IUn
 
 import {ForkBase} from "./ForkBase.sol";
 import {IERC20Meta} from "./interfaces/IUniswapMinimal.sol";
-import {StubPriceRef} from "./mocks/StubPriceRef.sol";
+import {V3TwapRef} from "../src/price-refs/V3TwapRef.sol";
 
 /// @notice The scenario every v3 test starts from: a maker with a real position in the real
 /// USDC/USDT 0.01% pool, and a callback approved to unwind it.
@@ -22,8 +22,13 @@ import {StubPriceRef} from "./mocks/StubPriceRef.sol";
 /// created against the deployed Midnight — and collapsing them would mean the unit suite silently
 /// depending on Midnight's market rules. The real one lives in `MidnightMarketBase`.
 abstract contract ParkedPositionBase is ForkBase {
-    /// @dev 1 bp. Held but not yet read by the adapter; see the note on `UniswapV3BuyCallback`.
+    /// @dev 1 bp.
     uint256 internal constant MAX_SLIPPAGE_WAD = 0.0001e18;
+
+    /// @dev 30 minutes of TWAP, read off the deep 0.01% pool. Reference is a third independent
+    /// choice from park and route; the deepest venue for the pair is the right default because
+    /// depth is what makes the mean tick expensive to move.
+    uint32 internal constant REF_WINDOW = 1800;
 
     /// @dev USDC (`0x8335…`) sorts below native USDT (`0xfde4…`), so the loan token is token0 and
     /// the residual is token1.
@@ -31,7 +36,7 @@ abstract contract ParkedPositionBase is ForkBase {
     uint256 internal constant PARKED_USDT = 10_000e6;
 
     address internal maker = makeAddr("maker");
-    StubPriceRef internal priceRef;
+    V3TwapRef internal priceRef;
     UniswapV3BuyCallbackFactory internal factory;
     UniswapV3BuyCallback internal callback;
     uint256 internal tokenId;
@@ -39,7 +44,7 @@ abstract contract ParkedPositionBase is ForkBase {
     function setUp() public virtual override {
         super.setUp();
 
-        priceRef = new StubPriceRef(1 << 96);
+        priceRef = new V3TwapRef(POOL_USDC_USDT_100, REF_WINDOW);
         factory = new UniswapV3BuyCallbackFactory(MIDNIGHT, V3_POSITION_MANAGER);
         callback = UniswapV3BuyCallback(
             factory.createCallback(maker, priceRef, MAX_SLIPPAGE_WAD, POOL_USDC_USDT_100, bytes32(0))
