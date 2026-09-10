@@ -4,12 +4,16 @@ pragma solidity 0.8.34;
 import {INonfungiblePositionManager, IUniswapV3Pool} from "../src/interfaces/IUniswapV3.sol";
 import {UniswapV3BuyCallback} from "../src/UniswapV3BuyCallback.sol";
 
-import {Offer} from "midnight/src/interfaces/IMidnight.sol";
+import {Offer, Market, CollateralParams} from "midnight/src/interfaces/IMidnight.sol";
 import {Signature, EIP712_DOMAIN_TYPEHASH} from "midnight/src/ratifiers/interfaces/IEcrecoverRatifier.sol";
 import {HashLib} from "midnight/src/ratifiers/libraries/HashLib.sol";
 
 import {MidnightMarketBase} from "./MidnightMarketBase.sol";
 import {IERC20Meta} from "./interfaces/IUniswapMinimal.sol";
+
+interface IOraclePrice {
+    function price() external view returns (uint256);
+}
 
 /// @notice **Pre-flight for the mainnet demo.** Every other suite parks 10,000 USDC + 10,000 USDT.
 /// The demo parks **ten dollars a side**, and that is a different regime: the same rounding, the
@@ -20,6 +24,16 @@ import {IERC20Meta} from "./interfaces/IUniswapMinimal.sol";
 /// mainnet with real money and a real counterparty. A demo that reverts in front of an audience
 /// because nobody checked the small-size regime is an avoidable way to fail.
 contract DemoPreflightTest is MidnightMarketBase {
+    /// @dev **The real, live Midnight market**, not one this suite invents: USDC lent against
+    /// cbBTC at 86% LLTV, priced by the deployed oracle, maturing 25 December 2026. Its id is
+    /// asserted below rather than trusted — the same market Morpho's own limit-order POC pins.
+    address internal constant REAL_ORACLE = 0x663BECd10daE6C4A3Dcd89F1d76c1174199639B9;
+    uint256 internal constant REAL_LLTV = 0.86e18;
+    uint256 internal constant REAL_CURSOR = 0.3e18;
+    uint256 internal constant REAL_MATURITY = 1798210800;
+    uint256 internal constant REAL_RCF_THRESHOLD = 3_000_000_000;
+    bytes32 internal constant REAL_MARKET_ID = 0x9593c3a6dba45b6106af8dc8b45ba8c505d90d3d68a3d33f7c278dd921b637da;
+
     /// @dev What the demo actually funds. Ten dollars a side.
     uint256 internal constant DEMO_USDC = 10e6;
     uint256 internal constant DEMO_USDT = 10e6;
@@ -37,6 +51,12 @@ contract DemoPreflightTest is MidnightMarketBase {
         demo = UniswapV3BuyCallback(
             factory.createCallback(maker, priceRef, MAX_SLIPPAGE_WAD, POOL_USDC_USDT_100, bytes32(uint256(99)))
         );
+
+        // Swap the fixture's invented market for the live one. Everything below then measures the
+        // demo as it will actually run.
+        market = _realMarket();
+        marketId = midnight.touchMarket(market);
+        assertEq(marketId, REAL_MARKET_ID, "the live market is not where it was pinned");
 
         demoTokenId = _mintSmallPosition();
         vm.prank(maker);
@@ -72,6 +92,31 @@ contract DemoPreflightTest is MidnightMarketBase {
         vm.stopPrank();
     }
 
+    function _realMarket() internal view returns (Market memory m) {
+        m.chainId = block.chainid;
+        m.midnight = MIDNIGHT;
+        m.loanToken = USDC;
+        m.collateralParams = new CollateralParams[](1);
+        m.collateralParams[0] =
+            CollateralParams({token: CBBTC, lltv: REAL_LLTV, liquidationCursor: REAL_CURSOR, oracle: REAL_ORACLE});
+        m.maturity = REAL_MATURITY;
+        m.rcfThreshold = REAL_RCF_THRESHOLD;
+    }
+
+    /// @dev Collateral sized off the **live** cbBTC oracle rather than the fixture's stub price,
+    /// doubled so the health check is never what fails in front of an audience.
+    function _collateralizeReal(address who, uint256 debt) internal {
+        uint256 price = IOraclePrice(REAL_ORACLE).price();
+        uint256 collateral = ((debt * 1e18 / REAL_LLTV) * 1e36 / price) * 2;
+
+        deal(CBBTC, who, collateral);
+        vm.startPrank(who);
+        IERC20Meta(CBBTC).approve(MIDNIGHT, collateral);
+        midnight.supplyCollateral(market, 0, collateral, who);
+        vm.stopPrank();
+        emit log_named_uint("cbBTC collateral for the taker (8dp)", collateral);
+    }
+
     function _demoData() internal view returns (bytes memory) {
         return abi.encode(demoTokenId);
     }
@@ -94,7 +139,7 @@ contract DemoPreflightTest is MidnightMarketBase {
         emit log_named_uint("bound at demo scale (USDC)", bound);
         assertGt(bound, 1e6, "the bound is under a dollar; the demo has nothing to show");
 
-        _collateralize(bound);
+        _collateralizeReal(taker, bound);
         uint128 liquidityBefore = _demoLiquidity();
 
         vm.prank(taker);
@@ -112,7 +157,7 @@ contract DemoPreflightTest is MidnightMarketBase {
 
     /// @dev What the demo should actually fill: a round number a viewer can follow, not the bound.
     function test_aRoundTenDollarFillSettles() public {
-        _collateralize(10e6);
+        _collateralizeReal(taker, 10e6);
         uint128 liquidityBefore = _demoLiquidity();
 
         vm.prank(taker);
@@ -130,7 +175,7 @@ contract DemoPreflightTest is MidnightMarketBase {
     /// wallet holding cbBTC, or just one. `onBuy` requires `buyer == OWNER`, and the buyer Midnight
     /// passes is the offer's maker — so the taker being the same address is not obviously refused.
     function test_canTheMakerTakeTheirOwnOffer() public {
-        _collateralizeFor(maker, 10e6);
+        _collateralizeReal(maker, 10e6);
 
         // `SelfTake()`. The demo needs two funded addresses, and the taker is the one that has to
         // hold cbBTC collateral.
@@ -142,7 +187,7 @@ contract DemoPreflightTest is MidnightMarketBase {
     /// @dev **Is a ratifier required?** The fixture deploys a `DummyRatifier`. If `address(0)` is
     /// accepted, the demo deploys one contract fewer on mainnet.
     function test_isARatifierRequired() public {
-        _collateralize(10e6);
+        _collateralizeReal(taker, 10e6);
 
         Offer memory offer = _demoOffer(10e6);
         offer.ratifier = address(0);
@@ -158,7 +203,7 @@ contract DemoPreflightTest is MidnightMarketBase {
     /// fewer — no `DummyRatifier` on mainnet, just a self-authorisation the maker already has to
     /// send anyway.
     function test_canTheMakerRatifyForThemselves() public {
-        _collateralize(10e6);
+        _collateralizeReal(taker, 10e6);
 
         vm.prank(maker);
         midnight.setIsAuthorized(maker, true, maker);
@@ -172,15 +217,6 @@ contract DemoPreflightTest is MidnightMarketBase {
         } catch (bytes memory err) {
             emit log_named_bytes("maker-as-ratifier refused", err);
         }
-    }
-
-    function _collateralizeFor(address who, uint256 debt) internal {
-        uint256 collateral = ((debt * 1e18 / LLTV) * 1e36 / CBBTC_PRICE) * 2;
-        deal(CBBTC, who, collateral);
-        vm.startPrank(who);
-        IERC20Meta(CBBTC).approve(MIDNIGHT, collateral);
-        midnight.supplyCollateral(market, 0, collateral, who);
-        vm.stopPrank();
     }
 
     /// @dev **The real publication path.** An earlier version of this demo invented its own
@@ -208,7 +244,7 @@ contract DemoPreflightTest is MidnightMarketBase {
 
         bytes memory ratifierData = _sign(offer, signerKey);
 
-        _collateralize(10e6);
+        _collateralizeReal(taker, 10e6);
         uint128 liquidityBefore = _demoLiquidity();
 
         vm.prank(taker);

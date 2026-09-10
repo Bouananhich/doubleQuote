@@ -12,17 +12,23 @@ import {INonfungiblePositionManager, IUniswapV3Pool} from "../src/interfaces/IUn
 import {IPriceRef} from "../src/interfaces/IPriceRef.sol";
 import {V3TwapRef} from "../src/price-refs/V3TwapRef.sol";
 
-import {DemoRatifier} from "./DemoRatifier.sol";
+import {OfferDigest} from "./OfferDigest.sol";
+
+import {Signature} from "midnight/src/ratifiers/interfaces/IEcrecoverRatifier.sol";
 
 interface IERC20 {
     function approve(address, uint256) external returns (bool);
     function balanceOf(address) external view returns (uint256);
 }
 
-/// @dev A fixed cbBTC price, so the demo's collateral leg is inert and honest about it. The
-/// collateral exists only to let the taker borrow; nothing in this project depends on its price.
-contract DemoOracle {
-    uint256 public constant price = 1e39;
+interface IOraclePrice {
+    function price() external view returns (uint256);
+}
+
+/// @dev `script/OfferDigest.sol`, reached through an interface on purpose: importing `HashLib` here
+/// would put it in the same compilation unit as `forge-std`, which does not compile. See its natspec.
+interface IOfferDigest {
+    function rootAndDigest(Offer memory offer) external view returns (bytes32 root, bytes32 digest);
 }
 
 /// @title Demo
@@ -50,9 +56,18 @@ contract Demo is Script {
     address internal constant USDT = 0xfde4C96c8593536E31F229EA8f37b2ADa2699bb2;
     address internal constant CBBTC = 0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf;
 
-    /// @dev Both enabled on the deployed Midnight; asserted in `MidnightIntegrationTest`.
-    uint256 internal constant LLTV = 0.77e18;
+    /// @dev Morpho's canonical signature ratifier, live on Base. The maker signs offers for it;
+    /// nothing bespoke is deployed for authorisation.
+    address internal constant ECRECOVER_RATIFIER = 0xd6e70365C8E8DDa9a4ca662C07bbE663b017755E;
+
+    /// @dev **The real market**: USDC against cbBTC at 86% LLTV, the deployed oracle, maturing
+    /// 25 December 2026. Its id is asserted at every step rather than trusted.
+    address internal constant REAL_ORACLE = 0x663BECd10daE6C4A3Dcd89F1d76c1174199639B9;
+    uint256 internal constant LLTV = 0.86e18;
     uint256 internal constant LIQUIDATION_CURSOR = 0.3e18;
+    uint256 internal constant MATURITY = 1798210800;
+    uint256 internal constant RCF_THRESHOLD = 3_000_000_000;
+    bytes32 internal constant MARKET_ID = 0x9593c3a6dba45b6106af8dc8b45ba8c505d90d3d68a3d33f7c278dd921b637da;
 
     /// @dev 1bp, and safe here only because the route venue *is* the reference venue — see D10 in
     /// `JOURNAL.md` for why a maker routing elsewhere needs a wider budget.
@@ -68,22 +83,20 @@ contract Demo is Script {
         address maker = msg.sender;
         vm.startBroadcast();
 
-        DemoOracle oracle = new DemoOracle();
-        DemoRatifier ratifier = new DemoRatifier(maker);
+        OfferDigest offerDigest = new OfferDigest(ECRECOVER_RATIFIER);
         V3TwapRef priceRef = new V3TwapRef(POOL_USDC_USDT_100, REF_WINDOW);
         UniswapV3BuyCallbackFactory factory = new UniswapV3BuyCallbackFactory(MIDNIGHT, V3_POSITION_MANAGER);
         address callback = factory.createCallback(
             maker, IPriceRef(address(priceRef)), MAX_SLIPPAGE_WAD, POOL_USDC_USDT_100, bytes32(0)
         );
 
-        // The maker's consent, and the only authorisation Midnight asks for: `take` carries no
-        // signature, so this is what makes the offer fillable.
-        IMidnight(MIDNIGHT).setIsAuthorized(address(ratifier), true, maker);
+        // Lets Morpho's ratifier speak for this maker. The offer itself is authorised by a
+        // signature, checked inside `EcrecoverRatifier`.
+        IMidnight(MIDNIGHT).setIsAuthorized(ECRECOVER_RATIFIER, true, maker);
 
         vm.stopBroadcast();
 
-        console.log("DEMO_ORACLE=%s", address(oracle));
-        console.log("DEMO_RATIFIER=%s", address(ratifier));
+        console.log("DEMO_OFFER_DIGEST=%s", address(offerDigest));
         console.log("DEMO_PRICE_REF=%s", address(priceRef));
         console.log("DEMO_FACTORY=%s", address(factory));
         console.log("DEMO_CALLBACK=%s", callback);
@@ -123,8 +136,6 @@ contract Demo is Script {
         // The whole custody story: the maker keeps the NFT and approves the callback for it.
         INonfungiblePositionManager(V3_POSITION_MANAGER).approve(callback, tokenId);
 
-        IMidnight(MIDNIGHT).touchMarket(_market());
-
         vm.stopBroadcast();
 
         console.log("DEMO_TOKEN_ID=%s", tokenId);
@@ -147,15 +158,32 @@ contract Demo is Script {
         console.log("buyerAssetsBound   : %s USDC (6dp)", bound);
     }
 
-    /// STEP 4 — the taker fills it ///
+    /// STEP 4 — the maker signs the offer ///
+
+    /// @dev Prints the EIP-712 digest and nothing else, so the key never reaches this process:
+    /// sign it with `cast wallet sign --account maker --no-hash <digest>`.
+    /// @dev The scheme signs a Merkle root of offers; a single offer is the degenerate tree, so the
+    /// root is the offer hash and the proof is empty.
+    function digest() external view {
+        Offer memory offer = _offer(vm.envAddress("DEMO_MAKER"), vm.envOr("DEMO_FILL", uint256(10e6)));
+        (bytes32 root, bytes32 toSign) = IOfferDigest(vm.envAddress("DEMO_OFFER_DIGEST")).rootAndDigest(offer);
+
+        console.log("offer root : %s", vm.toString(root));
+        console.log("sign this  : %s", vm.toString(toSign));
+    }
+
+    /// STEP 5 — the taker fills it ///
 
     function take() external {
         address maker = vm.envAddress("DEMO_MAKER");
         uint256 units = vm.envOr("DEMO_FILL", uint256(10e6));
 
-        // Enough cbBTC to be comfortably healthy at 77% LLTV, doubled so the health check is never
-        // the thing that fails in front of an audience.
-        uint256 collateral = ((units * 1e18 / LLTV) * 1e36 / 1e39) * 2;
+        Offer memory offer = _offer(maker, units);
+        bytes memory ratifierData = _ratifierData(offer);
+
+        // Sized off the live cbBTC oracle, doubled so the health check is never what fails in front
+        // of an audience.
+        uint256 collateral = ((units * 1e18 / LLTV) * 1e36 / IOraclePrice(REAL_ORACLE).price()) * 2;
 
         vm.startBroadcast();
         address taker = msg.sender;
@@ -163,8 +191,7 @@ contract Demo is Script {
         IERC20(CBBTC).approve(MIDNIGHT, collateral);
         IMidnight(MIDNIGHT).supplyCollateral(_market(), 0, collateral, taker);
 
-        (uint256 buyerAssets,) =
-            IMidnight(MIDNIGHT).take(_offer(maker, units), hex"", units, taker, taker, address(0), hex"");
+        (uint256 buyerAssets,) = IMidnight(MIDNIGHT).take(offer, ratifierData, units, taker, taker, address(0), hex"");
 
         vm.stopBroadcast();
 
@@ -183,19 +210,36 @@ contract Demo is Script {
         offer.tick = MAX_TICK;
         offer.callback = vm.envAddress("DEMO_CALLBACK");
         offer.callbackData = abi.encode(vm.envUint("DEMO_TOKEN_ID"));
-        offer.ratifier = vm.envAddress("DEMO_RATIFIER");
+        offer.ratifier = ECRECOVER_RATIFIER;
         offer.maxUnits = uint128(maxUnits);
         offer.continuousFeeCap = type(uint256).max;
     }
 
-    function _market() internal view returns (Market memory market) {
-        market.chainId = block.chainid;
+    /// @dev `DEMO_SIGNATURE` is the 65-byte output of `cast wallet sign`.
+    function _ratifierData(Offer memory offer) internal view returns (bytes memory) {
+        bytes memory sig = vm.envBytes("DEMO_SIGNATURE");
+        require(sig.length == 65, "DEMO_SIGNATURE must be 65 bytes");
+
+        bytes32 r;
+        bytes32 vs;
+        assembly {
+            r := mload(add(sig, 32))
+            vs := mload(add(sig, 64))
+        }
+        uint8 v = uint8(sig[64]);
+
+        (bytes32 root,) = IOfferDigest(vm.envAddress("DEMO_OFFER_DIGEST")).rootAndDigest(offer);
+        return abi.encode(Signature({v: v, r: r, s: vs}), root, uint256(0), new bytes32[](0));
+    }
+
+    function _market() internal pure returns (Market memory market) {
+        market.chainId = 8453;
         market.midnight = MIDNIGHT;
         market.loanToken = USDC;
-        market.maturity = vm.envUint("DEMO_MATURITY");
+        market.maturity = MATURITY;
+        market.rcfThreshold = RCF_THRESHOLD;
         market.collateralParams = new CollateralParams[](1);
-        market.collateralParams[0] = CollateralParams({
-            token: CBBTC, lltv: LLTV, liquidationCursor: LIQUIDATION_CURSOR, oracle: vm.envAddress("DEMO_ORACLE")
-        });
+        market.collateralParams[0] =
+            CollateralParams({token: CBBTC, lltv: LLTV, liquidationCursor: LIQUIDATION_CURSOR, oracle: REAL_ORACLE});
     }
 }

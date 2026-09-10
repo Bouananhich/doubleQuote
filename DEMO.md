@@ -5,14 +5,16 @@ same capital simultaneously quotes a fixed-rate loan on Midnight. A taker fills 
 **single transaction** the position unwinds just enough to cover it, the residual is sold, and the
 loan settles. What is left keeps earning.
 
-Every step below is a real transaction on Base against the deployed Midnight and the real
-USDC/USDT pool. Nothing is mocked except the collateral oracle, which is a fixed price and says so.
+Every step below is a real transaction on Base. **Nothing is mocked.** The loan settles into
+Midnight's live cbBTC/USDC market — 86% LLTV, the deployed `0x663BECd1…` oracle, maturing 25 December
+2026 — and the offer is authorised by Morpho's own `EcrecoverRatifier`. The market id is asserted
+against `0x9593c3a6…` at every step rather than trusted.
 
 ## What it costs
 
 | | |
 |---|---|
-| Deployment | **~$0.39** — measured, 11,086,289 gas at 0.0103 gwei |
+| Deployment | **~$0.36** — measured, 10,295,209 gas at 0.0103 gwei |
 | Maker capital | ~$20 — 10 USDC + 10 USDT, returned when the position is closed |
 | Taker capital | ~$26 of cbBTC collateral, returned when the loan is repaid |
 
@@ -60,12 +62,10 @@ and discovery are not prerequisites for settlement."
 ```shell
 export BASE_RPC_URL=...            # or leave unset for the public endpoint
 export DEMO_MAKER=0x...            # holds 10 USDC + 10 USDT + a little ETH
-export DEMO_TAKER=0x...            # holds ~$26 of cbBTC + a little ETH
-export DEMO_MATURITY=$(( $(date +%s) + 2592000 ))   # 30 days
+export DEMO_TAKER=0x...            # holds ~0.0003 cbBTC + a little ETH
 ```
 
-Keep `DEMO_MATURITY` **exactly the same for every step** — it is part of the market identity, and a
-different value is a different market.
+The market is pinned in the script, so there is no maturity to keep in sync.
 
 ## Step 1 — the maker deploys
 
@@ -74,8 +74,11 @@ forge script script/Demo.s.sol --tc Demo --sig "deploy()" \
   --rpc-url "$BASE_RPC_URL" --account maker --broadcast --verify
 ```
 
-Export the five addresses it prints (`DEMO_ORACLE`, `DEMO_RATIFIER`, `DEMO_PRICE_REF`,
-`DEMO_FACTORY`, `DEMO_CALLBACK`).
+Export the four addresses it prints (`DEMO_OFFER_DIGEST`, `DEMO_PRICE_REF`, `DEMO_FACTORY`,
+`DEMO_CALLBACK`). It also authorises `EcrecoverRatifier` to speak for the maker.
+
+`OfferDigest` is a `view` helper that returns what a maker has to sign. It exists because the
+ratifier computes that digest internally and offers no way to ask it — see `FRICTION.log`.
 
 ## Step 2 — the maker parks
 
@@ -105,7 +108,23 @@ the position is earning Uniswap fees the entire time it is being quoted.
 > **📸 Screenshot 2 — two order books, one pile of capital.**
 > The Uniswap position page and this number, side by side.
 
-## Step 4 — the taker fills it
+## Step 4 — the maker signs the offer
+
+```shell
+forge script script/Demo.s.sol --tc Demo --sig "digest()" --rpc-url "$BASE_RPC_URL"
+cast wallet sign --account maker --no-hash <the digest it printed>
+export DEMO_SIGNATURE=<the 65-byte signature>
+```
+
+The private key never enters a script process — the script prints a digest, `cast` signs it.
+
+What is being signed is a **Merkle root of offers**, so one signature can authorise a whole book and
+`cancelRoot` retires all of it in one transaction. A single offer is the degenerate tree.
+
+> At this point the offer is a complete, standard, signed Midnight offer. Everything after this is
+> somebody choosing to fill it.
+
+## Step 5 — the taker fills it
 
 ```shell
 forge script script/Demo.s.sol --tc Demo --sig "take()" \
@@ -121,6 +140,21 @@ forge script script/Demo.s.sol --tc Demo --sig "take()" \
 > Uniswap shows the position at roughly **half** its liquidity, still in range, still earning.
 > `https://app.morpho.org/base/address/$DEMO_MAKER` shows the fixed-rate lending position that did
 > not exist a minute ago.
+
+## Optional — publish it to the orderbook
+
+Morpho indexes offers and the app renders the depth (`https://api.morpho.org/v0/midnight/books`).
+Because step 4 produces a standard signed offer, it is publishable in principle — and whether the
+Router's mempool rules will index one naming an **unknown callback** is genuinely unknown.
+
+Try it *after* the demo has been shown to work, never before: the self-take path above always
+settles, and this one depends on somebody else's validation rules. Either outcome is worth having.
+If it indexes, the demo gains a screenshot of our offer sitting in Morpho's own depth chart. If it
+is refused, that is a sharper finding for `FEEDBACK.md` — a callback-backed offer being invisible to
+the public orderbook is exactly the kind of thing the Uniswap track's feedback form is asking about.
+
+> ⚠️ A published offer is publicly takeable by anyone, at the terms signed. That is the point, but
+> it means step 4's offer should be sized as something you are happy for a stranger to fill.
 
 ## Optional — the attack, on the same deployment
 
