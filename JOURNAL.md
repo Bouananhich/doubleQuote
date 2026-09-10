@@ -1229,3 +1229,145 @@ That is the v3-first build order, not an oversight, and it is the permissive dir
 what it can source, it just does not yet refuse to source it into a manipulated book. D10 ports both
 halves and re-runs the grief suite against them. The one number that moved on v4 is the bisection
 change, which is venue-agnostic.
+
+## 2026-09-10 (D9) — The dust bleed, measured: it does not grow with the number of takes
+
+D3 argued from theory that the per-fill economics are linear and therefore a configured minimum
+fill size is not load-bearing for safety. D9 is the measurement that argument was owed, and it
+holds — more sharply than the argument claimed.
+
+Fixing the grief volume at 2,000 USDC and splitting it every which way, against a fresh 10k+10k
+position each time:
+
+| takes | size each | maker's loss |
+|---|---|---|
+| 1 | 2,000 USDC | 0.131738 USDC |
+| 4 | 500 USDC | 0.130993 |
+| 20 | 100 USDC | 0.130834 |
+| 200 | 10 USDC | 0.131258 |
+
+A **200× increase in the number of takes moves the maker's cost by 0.7%**, and not monotonically.
+Splitting is very slightly *cheaper* for the maker over most of that range, because price impact is
+convex — two hundred small residual swaps each pay less of it than one large one, which more than
+covers the extra wei of rounding each take adds. The 200-take row turning back up is that trade
+crossing over.
+
+So the bleed is not a function of how often you are taken. It is 6.55bp of volume, which is the
+round-trip cost of the residual swap and nothing else. **There is no dust attack here, only
+ordinary execution cost charged per unit of business done.**
+
+That is entirely a property of D3's sized burn, and worth saying because it was not true before.
+Under D2's unconditional full unwind the first take of any size cost the maker the whole round trip
+on 19.9k and the second cost nothing, because there was nothing left. The superlinearity D1 worried
+about was that, and D3 removed it.
+
+## 2026-09-10 (D9) — How to size a buffer: face value, no leverage
+
+D3 left this open — "sizing that policy properly is a question for the D9 grief test". The answer is
+that there is no formula, because the buffer defends exactly its own face value and not a wei more.
+
+Funded with the whole 2,000 USDC grief, the position is never touched and the maker's cost is not
+small but **exactly zero**: every USDC the buffer pays out comes back as credit of the same size.
+Funded with half, take 11 of 20 is the first to reach the position and the bleed is half.
+
+So the maker policy is "hold as much idle loan token as you expect to be taken in dust between
+top-ups", and the docs should say it in those words. A buffer buys volume, not leverage.
+
+## 2026-09-10 (D9) — The minimum fill size already exists, and it is the slippage budget
+
+D3 declined to add a configured minimum, on the grounds that the sourcing floor self-calibrates.
+Measuring what it calibrates *to* turned out to be the most interesting thing in the day.
+
+| `MAX_SLIPPAGE_WAD` | smallest fill that settles | floor × budget |
+|---|---|---|
+| 1bp | 9,977 wei USDC | 0.998 wei |
+| 10bp | 999 | 0.999 |
+| 100bp | 102 | 1.02 |
+
+The floor is inversely proportional to the budget, and the constant of proportionality is **one
+wei**. The minimum fill size is the fill at which a single wei of rounding loss is the entire
+slippage budget. It needs no constant, no config and no guess, and it moves with the one knob the
+maker already sets.
+
+**And the mechanism is D8's cost guard, not D3's rounding check.** One wei below the floor the fill
+*does* source enough to cover itself — it reverts `SourcingCostAboveBudget(1.0001bp, 1bp)`. Deleting
+the guard drops the floor to **2 wei**. So the dust floor and the sandwich guard are the same
+mechanism seen at two scales, which is a better property than having two.
+
+The D3 reasons against configuring one all still stand and are now cheaper to state: a configured
+minimum has to be guessed, strands the tail of a partially-filled offer below it, and has no channel
+to be advertised on, since `buyerAssetsBound` publishes a maximum and the callback interface has no
+minimum.
+
+## 2026-09-10 (D9) — The grief priced from the attacker's side
+
+The bleed tests measure what the maker loses. What settles the question is what the attacker pays.
+
+One unbuffered 10 USDC take destroys **648 wei of USDC** of maker value and costs the attacker
+**565,589 gas** — a full unwind, burn and collect and swap, every time. Measured cold, one
+transaction per take, because that is how griefing actually works; amortising it across a loop reads
+~297k and flatters the attacker.
+
+Breakeven — the gas price at which the grief costs the attacker what it costs the maker — is
+**0.00034 gwei** with ETH at $3,400. Base clears one to two orders of magnitude above that, and this
+ignores the L1 data cost, which on Base is usually the larger half of the bill. The attacker also
+has to post collateral and carry the debt.
+
+The dust grief is uneconomic by a wide margin with no minimum fill size, no rate limit and no
+allowlist. The defence is that settlement is expensive to trigger and cheap to serve.
+
+## 2026-09-10 (D9) — D8's cost guard does not subsume D3's escalation ceiling
+
+Found by mutation. Replacing `escalationCeiling(burn, position.liquidity)` with
+`position.liquidity` — undoing D3's proportionality fix outright — leaves every D9 bleed test green.
+The cost guard catches it: escalating to the whole position for a dust fill now costs far more than
+1bp, so it reverts rather than settling, and the maker's position survives.
+
+That is not a reason to drop the ceiling. At a **100bp** budget the same mutation drops the floor to
+**1 wei**, which means the D3 kill comes back in full: a one-wei take unwinds the entire position
+and passes the guard, because 100bp is enough room to pay for it. The guard covers the 1bp maker and
+not the 100bp one.
+
+Two defences that overlap for the configuration you happen to test are not one defence. Recorded
+because the mutation looked survivable and was not. The full suite kills it seven ways, including
+`test_aDustFillCannotUnwindThePosition`, which is the test D3 wrote for exactly this.
+
+## 2026-09-10 (D9) — Licensing, resolved
+
+Three questions, closed together.
+
+**1. The repo is GPL-2.0-or-later, and now says so.** `LICENSE` at the root, the GPL-2.0 text.
+Forced rather than chosen: `UniswapBuyCallbackBase` is forked from Morpho's
+`src/periphery/blue-buy-callback/`, which is GPL-2.0-or-later, so the derivative is too. Every
+source file already carried the header; the repo did not carry the licence. Open since D4.
+
+**2. Nothing BUSL-1.1 is compiled into this project — verified, not asserted.** Both dependencies
+ship BUSL core beside permissive periphery in one tree: v4-core's `PoolManager.sol` is BUSL and the
+libraries around it are MIT; Midnight's core is BUSL and its periphery is GPL-2.0-or-later. All 29
+dependency imports across `src/` and `test/` resolve to MIT or GPL-2.0-or-later.
+
+That is a property that decays one import at a time, so `script/check-licenses.sh` now enforces it
+in CI. Checked the way every probe here gets checked: it fails on purpose (`incompatible license
+'BUSL-1.1' imported: v4-core/PoolManager.sol`) before its green means anything.
+
+**3. D10's oracle source changes.** Risk #4 was "`UNLICENSED` headers on the oracle sources conflict
+with an open-source submission". The premise is gone: Uniswap's truncated-oracle example has been
+**deleted from `v4-periphery`**, so there is no canonical source to fork with or without a licence
+on it. What survives is a scattering of third-party copies, MIT but unattributed, several edited,
+with no upstream to diff against.
+
+So `TruncatedOracleRef` will read **OpenZeppelin's `uniswap-hooks`** (MIT, maintained), not a fork
+of a deleted example. MIT into GPL-2.0-or-later is a one-way compatible relicense, so it can sit in
+the tree with its own header preserved.
+
+The substitute is better than the thing it replaces, which was not the expectation. Their
+`BaseOracleHook` records *two* accumulators per observation — the ordinary `tickCumulative` and a
+`tickCumulativeTruncated` capped at `maxAbsTickDelta` per block — and `V3TruncatedOracleAdapter`
+exposes the truncated series through a **v3-shaped `observe(secondsAgos)`**. So `TruncatedOracleRef`
+is `V3TwapRef` pointed somewhere else, not a second implementation, and the D10 comparison becomes
+one where the *only* difference between the two references is the truncation. That is the
+apples-to-apples the D8 entry asked for and did not expect to get. It also compiles: `^0.8.19`,
+v4-core imports only.
+
+This is a change to the D10 plan, made on D9 as scheduled, and the reason it was scheduled before
+D10 rather than during it.

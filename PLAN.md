@@ -234,8 +234,36 @@ the assertions inverted. *(Done — the sandwich reverts and the attacker loses 
   for route spot — undoing the day's central change — failed one assertion by 0.9%, because the two
   agree on a quiet fork. Two library tests now separate them explicitly.
 
-**Next:** D9 — the dust-take grief test, the minimum-fill-size decision, and **the oracle licensing
-question, which now has real oracle code attached to it**. The root `LICENSE` file is still missing.
+## D9 — done
+
+The dust grief, measured; and licensing closed. **197/197.**
+
+- **The bleed does not grow with the number of takes.** Fixing the grief volume at 2,000 USDC and
+  splitting it 1 / 4 / 20 / 200 ways moves the maker's cost by **0.7%**, and not monotonically:
+  0.131738 / 0.130993 / 0.130834 / 0.131258 USDC. It is 6.55bp of *volume* — the round-trip cost of
+  the residual swap and nothing else. D3's linearity argument holds; the superlinear bleed D1
+  worried about was D2's unconditional full unwind, and it is gone.
+- **A funded buffer flattens it to exactly zero**, and defends exactly its own face value: funded
+  with half the grief, take 11 of 20 is the first to touch the position. That is the buffer-sizing
+  answer D3 deferred to today — hold what you expect to be taken in dust, no leverage, no formula.
+- **The minimum fill size already exists and it is the slippage budget.** Smallest settling fill is
+  9,977 wei at 1bp, 999 at 10bp, 102 at 100bp — inversely proportional, with one wei of rounding as
+  the constant. **No configured minimum**, and the D3 reasoning now has a measurement under it.
+- **The grief is uneconomic from the attacker's side.** One 10 USDC unbuffered take destroys 648 wei
+  of maker value and costs 565,589 gas. Breakeven is **0.00034 gwei**.
+- **Licensing closed.** Root `LICENSE` (GPL-2.0-or-later, forced by the Morpho periphery fork), and
+  `script/check-licenses.sh` in CI proving all 29 dependency imports are MIT or GPL-2.0-or-later —
+  nothing BUSL-1.1 compiles into this project. Risk #4 is retired.
+- **D10's oracle source changed.** Uniswap's truncated-oracle example has been deleted from
+  `v4-periphery`; `TruncatedOracleRef` will read OpenZeppelin's `uniswap-hooks` instead (MIT), whose
+  adapter exposes the truncated series through a v3-shaped `observe()` — so it is `V3TwapRef`
+  pointed elsewhere rather than a second implementation. See `JOURNAL.md`.
+- Mutation-checked three ways, and one mutation is recorded rather than merely killed: deleting
+  D3's escalation ceiling leaves every D9 test green, because D8's cost guard catches it *at 1bp*.
+  At 100bp it does not, and the one-wei kill returns. The two defences overlap; they are not one.
+
+**Next:** D10 — port the grief test and the D8 fix to v4, add `TruncatedOracleRef`, hook address
+mining, and run the D7 attack against both references.
 
 Build order is **v3 first, v4 second, both shipped**. v3 is load-bearing — its native
 `observe()` makes the price-reference work straightforward. If a day goes missing, v4 is cut,
@@ -286,7 +314,7 @@ The prep window (Mon 31 Aug → Thu 3 Sep) was not used. These are prerequisites
 | Day | Deliverable |
 |-----|-------------|
 | **D8** (Fri 11) | The fix on v3 ✅, a day early. `V3TwapRef` + a cost guard measured against it; the D7 sandwich reverts at 44.60% and the attacker ends **−2,998.04**. Also fixed a bound that promised fills the executor would not honour. |
-| **D9** (Sat 12) | Dust-take grief test — N repeated dust takes, bleed without the buffer, flat line with it. Also the decision point for a configured **minimum fill size**: deliberately skipped on D3 because the bleed is linear and the sourcing floor self-calibrates, so revisit only if the measured bleed contradicts that (see `JOURNAL.md`). **Resolve the oracle licensing question today**, before D10 depends on it. |
+| **D9** (Sat 12) | ✅ **Done, two days early.** Dust-take grief test — N repeated dust takes, bleed without the buffer, flat line with it. Also the decision point for a configured **minimum fill size**: deliberately skipped on D3 because the bleed is linear and the sourcing floor self-calibrates, so revisit only if the measured bleed contradicts that (see `JOURNAL.md`) — measured, and the decision stands. Licensing resolved: root `LICENSE`, a CI compliance check, and a new source of record for D10's oracle. |
 | **D10** (Sun 13) | Port grief + fix to v4; add `TruncatedOracleRef` with a seeded oracle pool in-fork. Hook address mining. Run the D7 attack against both references. |
 | **D11** (Mon 14) | **The frontier chart** — sweep range width, plot fee APR against `buyerAssetsBound`. Plus gas benchmarks: v3 vs v4 vs `BlueBuyCallback`, buffer-hit and buffer-miss separately. |
 | **D12** (Tue 15) | README with script-generated claim → file → line table. `FEEDBACK.md` edited from `FRICTION.log`. |
@@ -344,8 +372,10 @@ artifact aimed squarely at a Uniswap judge.
 3. **The oracle work becomes a rabbit hole.** Timebox hard. `V3TwapRef` must exist;
    `TruncatedOracleRef` makes the comparison interesting; `MedianRef` is decoration. Cut from the
    right. Budget half a day for hook address mining.
-4. **Licensing.** `UNLICENSED` headers on the oracle sources conflict with an open-source
-   submission. Resolve D9.
+4. ~~**Licensing.** `UNLICENSED` headers on the oracle sources conflict with an open-source
+   submission. Resolve D9.~~ **Retired D9.** The repo carries a GPL-2.0-or-later `LICENSE`, CI
+   enforces that nothing BUSL-1.1 is imported, and the oracle source in question turned out to have
+   been deleted from `v4-periphery` — D10 uses OpenZeppelin's MIT `uniswap-hooks` instead.
 5. **Scope creep into writing a hook for the position itself.** Consuming an oracle hook is cheap
    and on-thesis; building one to hold liquidity is a different project. Resist.
 6. **Yield accrual can't be shown live** on a weekly incentive cadence. Simulate or show

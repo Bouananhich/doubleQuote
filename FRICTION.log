@@ -268,3 +268,35 @@ part that makes the feedback actionable and the part that is impossible to recon
     friction is that this is entirely on the integrator to think of — nothing in the interface hints
     that the oracle is the one dependency whose readiness is a deployment-time property.
     (cost: ~10m)
+
+2026-09-10 17:20  [v4]  The truncated-oracle example has been deleted from `v4-periphery`.
+    `PLAN.md` schedules a `TruncatedOracleRef` for D10 on the strength of Uniswap shipping a
+    reference truncated-tick oracle hook. It is not there any more: `src/hooks/` in `v4-periphery`
+    `main` contains exactly one entry (`permissionedPools`), and `src/libraries/` has no oracle at
+    all. A GitHub code search for `TruncatedOracle` returns twenty-odd forks in third-party repos
+    and nothing in a Uniswap-owned one.
+    That matters more for a hook than for an ordinary deleted example, because a hook is the one
+    kind of contract an integrator cannot simply point at — reading a truncated oracle in a fork
+    test means *deploying* one, which means having its source and knowing its licence. The
+    surviving copies are MIT, but they are unattributed forks of a deleted file, several of them
+    edited, and there is no upstream to diff against. The maintained thing that does exist is
+    OpenZeppelin's `uniswap-hooks` (MIT), which is what D10 will use instead.
+    An example that gets deleted rather than archived leaves its downstream with no way to tell a
+    faithful copy from a modified one. A tag, a deprecation note, or an `examples/` repo would each
+    have been enough.
+    (cost: ~25m, and it moved D10's source of record)
+
+2026-09-10 17:35  [v4]  BUSL-1.1 and MIT live in the same tree with no manifest.
+    `lib/v4-core/src` mixes `PoolManager.sol` (BUSL-1.1) with the libraries and interfaces around it
+    (MIT), and `lib/midnight/src` does the same with its core and its periphery. Neither ships a
+    machine-readable statement of which is which, so "we only bind the licensed-restrictively parts
+    through interfaces" — the claim that lets this repo be GPL-2.0-or-later at all — can only be
+    checked by opening every file an import resolves to.
+    Doing that by hand once is fine; keeping it true across a repo that adds imports daily is not.
+    Wrote `script/check-licenses.sh` and put it in CI. It resolves every `v4-core/`, `midnight/` and
+    `forge-std/` import in `src/` and `test/` to a file, reads its SPDX header, and fails on
+    anything that is not GPL-2.0-or-later-compatible. All 29 currently resolve to MIT or
+    GPL-2.0-or-later; nothing BUSL is compiled into this project.
+    A `LICENSES.md` or an SPDX manifest at the root of each repo would make this a lookup instead of
+    a crawl. The per-file headers are correct and complete — they are just not aggregated anywhere.
+    (cost: ~20m)
