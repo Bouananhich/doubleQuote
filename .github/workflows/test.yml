@@ -41,11 +41,12 @@ jobs:
         run: forge build --sizes
 
       # The repo is GPL-2.0-or-later. Both Uniswap v4 and Midnight ship BUSL-1.1 core beside
-      # permissively-licensed interfaces and libraries in the same tree, so "we only bind the core
-      # through interfaces" is a claim that can quietly stop being true one import at a time.
-      # This is the check that it stays true. See `script/check-licenses.sh`.
+      # permissively-licensed interfaces and libraries in the same tree, and BUSL does reach this
+      # build — four files, all behind MIT libraries that import them. That is permitted and is not
+      # the point; the point is that the set stays known. This fails when it changes.
+      # See `script/check-licenses.py`.
       - name: Check dependency licenses
-        run: ./script/check-licenses.sh
+        run: ./script/check-licenses.py
 
       # The whole suite forks Base. Caching the RPC responses keeps repeat runs off the network:
       # without it every job re-fetches the same state at the pinned block, which is slow and

@@ -1341,14 +1341,23 @@ Forced rather than chosen: `UniswapBuyCallbackBase` is forked from Morpho's
 `src/periphery/blue-buy-callback/`, which is GPL-2.0-or-later, so the derivative is too. Every
 source file already carried the header; the repo did not carry the licence. Open since D4.
 
-**2. Nothing BUSL-1.1 is compiled into this project — verified, not asserted.** Both dependencies
-ship BUSL core beside permissive periphery in one tree: v4-core's `PoolManager.sol` is BUSL and the
-libraries around it are MIT; Midnight's core is BUSL and its periphery is GPL-2.0-or-later. All 29
-dependency imports across `src/` and `test/` resolve to MIT or GPL-2.0-or-later.
+**2. The BUSL-1.1 surface is enumerated and enforced.** Both dependencies ship BUSL core beside
+permissive periphery in one tree: v4-core's `PoolManager.sol` is BUSL and the libraries around it
+are MIT; Midnight's core is BUSL and its periphery is GPL-2.0-or-later.
 
-That is a property that decays one import at a time, so `script/check-licenses.sh` now enforces it
-in CI. Checked the way every probe here gets checked: it fails on purpose (`incompatible license
-'BUSL-1.1' imported: v4-core/PoolManager.sol`) before its green means anything.
+`script/check-licenses.py` inventories every source in the build and fails when the BUSL set
+changes. Four files are in it, all pulled in behind MIT libraries:
+
+| file | reached via |
+|---|---|
+| `Position.sol` | `StateLibrary` |
+| `CurrencyReserves.sol`, `Lock.sol`, `NonzeroDeltaCount.sol` | `TransientStateLibrary` |
+
+That is permitted. BUSL-1.1 grants copying, redistribution and **non-production use** outright;
+only production use needs the Additional Use Grant at `v4-core-license-grants.uniswap.eth`, and the
+Change Date is 2027-06-15, after which v4-core becomes MIT. Nothing here is a violation — but
+anything deployed for real needs that grant read first, which is why the set is pinned rather than
+merely counted.
 
 **3. D10's oracle source changes.** Risk #4 was "`UNLICENSED` headers on the oracle sources conflict
 with an open-source submission". The premise is gone: Uniswap's truncated-oracle example has been
@@ -1390,3 +1399,37 @@ docstring, attributed to the version that produced them.
 The general rule, since this will come up again on D11's gas table: **pin what the contract decides,
 bound what the toolchain decides.** Bounds, fills, prices and costs are exact and stay exact. Gas
 gets a floor or a ceiling in whichever direction the claim runs.
+
+## 2026-09-10 (D9, corrected same day) — The licence check was one hop deep, and the claim was false
+
+The check shipped in the D9 commit walked the imports written in `src/` and `test/`, resolved each
+to a file, and read its SPDX header. It reported "all 29 dependency imports are MIT or
+GPL-2.0-or-later; nothing BUSL-1.1 is compiled into this project."
+
+That is wrong, and it was wrong in the way static checks usually are: it measured what I wrote
+rather than what the compiler builds. `StateLibrary` and `TransientStateLibrary` are both MIT and
+both import BUSL-1.1 files. One hop sees 29 files; the actual build closure is **64**, and four of
+them are BUSL:
+
+- `Position.sol`, via `StateLibrary`
+- `CurrencyReserves.sol`, `Lock.sol`, `NonzeroDeltaCount.sol`, via `TransientStateLibrary`
+
+**The rewrite reads Foundry's `out/build-info` instead of parsing imports at all.** That is the
+compiler's own record of every source in each compilation unit — ground truth rather than a
+re-implementation of solc's resolver, which is the same reasoning that put `TickBookLib` on the
+pool's own `TickBitmap` rather than a re-derivation. It clears `build-info` before rebuilding,
+because Foundry writes one file per unit and never prunes, so a stale unit reports imports nothing
+has any more.
+
+**And what it enforces changed, because "no BUSL" was the wrong bar.** BUSL-1.1 grants
+redistribution and non-production use outright; the four files are permitted here. The property
+worth guarding is not their absence but their *enumeration* — the check now fails when the BUSL set
+changes, which is exactly when somebody should look again, and in particular before anything is
+deployed for real.
+
+Two things to keep from this. **A licence claim about a build has to be made against the build**,
+and a hackathon submission stating one publicly is not a place to approximate. And **the mutation
+test I ran was too weak to catch it**: I added a *direct* import of a BUSL file, which the one-hop
+check was always going to see. A mutation that only exercises the path you had in mind proves the
+code does what you meant, not what you claimed. The replacement is mutated by reaching a BUSL file
+that is genuinely off the expected list (`Pool.sol`), which fails, as it must.

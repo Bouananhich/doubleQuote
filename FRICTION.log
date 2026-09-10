@@ -292,11 +292,17 @@ part that makes the feedback actionable and the part that is impossible to recon
     machine-readable statement of which is which, so "we only bind the licensed-restrictively parts
     through interfaces" — the claim that lets this repo be GPL-2.0-or-later at all — can only be
     checked by opening every file an import resolves to.
-    Doing that by hand once is fine; keeping it true across a repo that adds imports daily is not.
-    Wrote `script/check-licenses.sh` and put it in CI. It resolves every `v4-core/`, `midnight/` and
-    `forge-std/` import in `src/` and `test/` to a file, reads its SPDX header, and fails on
-    anything that is not GPL-2.0-or-later-compatible. All 29 currently resolve to MIT or
-    GPL-2.0-or-later; nothing BUSL is compiled into this project.
-    A `LICENSES.md` or an SPDX manifest at the root of each repo would make this a lookup instead of
-    a crawl. The per-file headers are correct and complete — they are just not aggregated anywhere.
-    (cost: ~20m)
+    And the mixing is not shallow. `StateLibrary` and `TransientStateLibrary` are MIT, and both
+    import BUSL-1.1 files — `Position`, `Lock`, `CurrencyReserves`, `NonzeroDeltaCount` — so reading
+    a v4 pool's state through the library Uniswap provides for it pulls BUSL into the build whether
+    or not the integrator ever names a BUSL file. Nothing is wrong with that, since BUSL-1.1 grants
+    redistribution and non-production use outright, but an integrator who needs to know their BUSL
+    surface (anyone shipping under a copyleft licence, which is anyone forking Morpho's periphery)
+    cannot learn it by reading their own imports. I got this wrong first time round and had to
+    rewrite the check against Foundry's build-info to get a true answer: 29 direct imports, 64
+    sources in the actual closure, four of them BUSL.
+    A `LICENSES.md` at the root of each repo, or simply a note on `StateLibrary` saying what it
+    pulls in, would make this a lookup instead of a crawl.
+    The per-file headers are correct and complete — they are just not aggregated anywhere, and the
+    one place aggregation would matter most is the transitive case.
+    (cost: ~20m, plus ~30m rewriting it after the one-hop version gave a confidently wrong answer)

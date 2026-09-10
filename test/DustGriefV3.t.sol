@@ -32,8 +32,11 @@ contract DustGriefV3Test is MidnightMarketBase {
     /// is the *only* thing that varies. Comfortably inside the bound at every split.
     uint256 internal constant VOLUME = 2_000e6;
 
-    /// @dev How the sweep splits `VOLUME`. 200 takes of 10 USDC is the shape of the attack: the
-    /// smallest fills that still clear the sourcing floor by a wide margin.
+    /// @dev How the *buffer* tests split `VOLUME`: 20 takes of 100 USDC. Small enough to be dust
+    /// against a 19.9k position, large enough that a half-funded buffer runs out at a countable
+    /// take rather than somewhere in the rounding.
+    /// @dev The bleed sweep does not use this — it varies the split itself, 1 through 200, which is
+    /// the whole point of it.
     uint256 internal constant SPLIT = 20;
 
     function setUp() public override {

@@ -253,8 +253,12 @@ The dust grief, measured; and licensing closed. **197/197.**
   of maker value and costs 565,589 gas (forge 1.5.1; 586,929 on 1.8.1 — the assertion is a floor,
   not a pin, see `JOURNAL.md`). Breakeven is **0.00034 gwei**.
 - **Licensing closed.** Root `LICENSE` (GPL-2.0-or-later, forced by the Morpho periphery fork), and
-  `script/check-licenses.sh` in CI proving all 29 dependency imports are MIT or GPL-2.0-or-later —
-  nothing BUSL-1.1 compiles into this project. Risk #4 is retired.
+  `script/check-licenses.py` in CI inventorying the **build closure** — 64 dependency sources, of
+  which **four are BUSL-1.1**, all reached behind MIT libraries (`StateLibrary`,
+  `TransientStateLibrary`). Permitted: BUSL grants redistribution and non-production use outright.
+  The check pins that set and fails when it changes. Risk #4 is retired.
+  *(The first version of this check was one hop deep and claimed no BUSL reached the build at all —
+  corrected same day, see `JOURNAL.md`.)*
 - **D10's oracle source changed.** Uniswap's truncated-oracle example has been deleted from
   `v4-periphery`; `TruncatedOracleRef` will read OpenZeppelin's `uniswap-hooks` instead (MIT), whose
   adapter exposes the truncated series through a v3-shaped `observe()` — so it is `V3TwapRef`
@@ -375,7 +379,7 @@ artifact aimed squarely at a Uniswap judge.
    right. Budget half a day for hook address mining.
 4. ~~**Licensing.** `UNLICENSED` headers on the oracle sources conflict with an open-source
    submission. Resolve D9.~~ **Retired D9.** The repo carries a GPL-2.0-or-later `LICENSE`, CI
-   enforces that nothing BUSL-1.1 is imported, and the oracle source in question turned out to have
+   pins the BUSL-1.1 files that reach the build, and the oracle source in question turned out to have
    been deleted from `v4-periphery` — D10 uses OpenZeppelin's MIT `uniswap-hooks` instead.
 5. **Scope creep into writing a hook for the position itself.** Consuming an oracle hook is cheap
    and on-thesis; building one to hold liquidity is a different project. Resist.
