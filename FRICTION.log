@@ -210,10 +210,29 @@ part that makes the feedback actionable and the part that is impossible to recon
     FEEDBACK.md: the honest bound is the one that reads the book, reading the book is what makes a
     quoter RPC-expensive, and the cost lands on *anyone forking to test an integration*, not just
     on the quoter's own users.
-    Then the mitigation cost its own detour. `--compute-units-per-second` and
-    `--fork-retry-backoff` are `forge test` CLI flags only; putting them under `[profile.ci]` in
-    `foundry.toml` emits "Found unknown `compute_units_per_second` config for profile `ci`" and is
-    otherwise ignored (forge 1.5.1). Fork settings that *are* toml keys sit right next to ones
-    that are not, and the warning only appears if you happen to run `forge config` — `forge test`
-    accepts the file silently and runs unthrottled. Moved to the workflow's `run:` line.
-    (cost: ~15m)
+    Then the mitigation turned out not to exist, in three layers. `compute_units_per_second` and
+    `fork_retry_backoff` under `[profile.ci]` emit "Found unknown config" and are ignored (forge
+    1.5.1) — and only `forge config` prints that warning, `forge test` accepts the file silently
+    and runs unthrottled. As CLI flags they refuse to parse without an accompanying `--rpc-url`,
+    which this suite has no use for because it forks from inside `setUp()`. And with `--rpc-url`
+    supplied to satisfy the parser, they still do nothing: **`--compute-units-per-second 1`
+    against a cleared cache finishes a fork test in 2.44s**, so the throttle plainly does not
+    reach forks created by `vm.createSelectFork`. Three ways to believe a suite is rate-limited
+    when it is not, and the only one that says anything out loud says it in a different command.
+    The knob a cheatcode-forking suite actually needs — throttle *this* fork — has no spelling.
+    (cost: ~45m)
+
+2026-09-10 12:50  [tooling]  `actions/cache` will not save from a failing job, which is the one
+    whose fetches are worth keeping.
+    The combined `actions/cache@v4` only writes its entry in the post step when the job
+    *succeeded*. For a fork suite priming an RPC cache that is exactly backwards: the run that
+    dies partway through fetching new state is the run that fetched the most new state. D7 hit the
+    deadlock — the suite had grown past what the public endpoint serves in one run, every attempt
+    429'd partway, none of them saved, and each retry restarted from the same stale cache. A green
+    suite locally, a permanently red CI, and re-running never converges.
+    Split into `actions/cache/restore` plus `actions/cache/save` with `if: always()` and
+    consecutive runs accumulate instead. Worth knowing before you conclude the endpoint is simply
+    too small: it may be that nothing you fetch is ever being kept. `save-always` used to express
+    this on the combined action and was deprecated without the docs foregrounding the split as its
+    replacement for this case.
+    (cost: ~20m)
