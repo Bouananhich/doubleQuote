@@ -286,8 +286,55 @@ First half done: **the v4 fix, and the attack that proves it.** 201/201.
 - Three mutations, all now killed. Two of them initially survived, including a test that passed
   under the very mutation it was written for — see `JOURNAL.md`.
 
-**Still to do on D10:** `TruncatedOracleRef` against OpenZeppelin's `uniswap-hooks`, hook address
-mining, and the D7 attack run against both references.
+## Re-scoped 2026-09-10, with 8 days left and 3 days of slack
+
+Reviewed what was built against what the submission actually needs, and moved the remaining effort
+towards the demo and the two required artifacts.
+
+**Cut:** `TruncatedOracleRef`, hook address mining, `MedianRef`, and the full frontier sweep. The
+plan always said to cut from the right, and D10's first half produced a *better* oracle result than
+the truncation comparison was going to — the 0.75bp tick-quantisation basis, which is a finding
+about any `observe()`-derived reference rather than about one hook. Recorded as future work.
+
+**The reason for the change:** both required submission artifacts were still D1 stubs. `FEEDBACK.md`
+is 131 lines of pre-build speculation whose own header says it should not ship unverified, and one
+of its six claims (the truncated-oracle sample being `UNLICENSED`) was disproved on D9 — the sample
+has been deleted from `v4-periphery` entirely and the survivors are MIT. Meanwhile 23 real
+`FRICTION.log` entries were waiting to replace guesses.
+
+**The demo runs against a Base fork, not mainnet.** Deployment is not the constraint — priced at
+live Base gas (0.006 gwei) the whole system costs **~$0.49** to deploy. Capital is: an end-to-end
+mainnet demo needs a funded LP position and a taker holding cbBTC collateral, roughly $70 of real
+money and a second funded address, for something nobody will interact with. A fork at `FORK_BLOCK`
+binds the *real* deployed Midnight and the *real* pools with *real* liquidity, produces the same
+numbers, costs nothing, and anyone can re-run it. A mainnet deploy of the factory and `V3TwapRef`
+alone (~$0.10, no capital) remains available if the README wants a Basescan link.
+
+**Revised again the same day, on the maker's steer: the demo runs on mainnet after all.** The
+visual requirement is better served by real frontends — a Uniswap position page accruing fees, then
+a Morpho lending position that did not exist a minute earlier — than by any page we could build. At
+$10 a side that costs **$0.39 of gas** (measured, not estimated) and ~$46 of capital that comes back.
+A fork script proves the logic; only mainnet proves it is real.
+
+| | Deliverable | State |
+|-----|-----|-----|
+| **Demo** | `script/Demo.s.sol` + `DEMO.md` — four steps, four screenshots, real transactions | **done, unexecuted** |
+| **Pre-flight** | `test/DemoPreflight.t.sol` — the demo's exact configuration on a fork | **done** |
+| **`FEEDBACK.md`** | Rewritten from the 23 verified `FRICTION.log` entries | next |
+| **README** | Claim → file → line table, so every claim is checkable | next |
+
+### What the pre-flight found, before any money moved
+
+- The bound at $10/side is **19.871711 USDC**, and a take of exactly that settles to the wei.
+- **A round 10 USDC fill burns exactly half the position** — the thesis in one screenshot.
+- `SelfTake()`: a maker cannot take their own offer, so the demo needs **two funded addresses**.
+- A ratifier must be a **contract** — `address(0)` and an EOA are both refused. Hence
+  `script/DemoRatifier.sol`, and a `FEEDBACK.md` note: a maker cannot participate in Midnight at all
+  without deploying one.
+- **`take` carries no signature.** An offer is a struct the taker supplies; the maker's consent is
+  `setIsAuthorized` plus the NFT approval. There is no orderbook to publish to, which settles the
+  open question about whether an unknown callback would be whitelisted — there is nothing to be
+  whitelisted *by*.
 
 Build order is **v3 first, v4 second, both shipped**. v3 is load-bearing — its native
 `observe()` makes the price-reference work straightforward. If a day goes missing, v4 is cut,
