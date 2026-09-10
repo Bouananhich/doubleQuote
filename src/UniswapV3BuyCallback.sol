@@ -74,15 +74,6 @@ contract UniswapV3BuyCallback is UniswapBuyCallbackBase, IUniswapV3BuyCallback, 
         uint128 owed1;
     }
 
-    /// @dev Running totals for the residual sales one settlement makes: what they were worth at
-    /// `PRICE_REF`, and what the route venue paid. Carried as a memory struct so the sized burn's
-    /// swap and the escalation's both report into one place, and the budget is then checked over
-    /// the settlement rather than over whichever swap happened last.
-    struct Sale {
-        uint256 referenceValue;
-        uint256 proceeds;
-    }
-
     /// @inheritdoc IUniswapV3BuyCallback
     address public immutable POSITION_MANAGER;
     /// @inheritdoc IUniswapV3BuyCallback
@@ -134,7 +125,7 @@ contract UniswapV3BuyCallback is UniswapBuyCallbackBase, IUniswapV3BuyCallback, 
 
         // Accumulated across both swaps: what the residual was worth at `PRICE_REF`, and what the
         // route venue actually paid for it. Their difference is the cost the budget caps.
-        Sale memory sale;
+        SourcingMathLib.Sale memory sale;
 
         uint128 burn = _liquidityForShortfall(position, loanToken == position.token0, shortfall);
         _unwind(tokenId, burn);
@@ -221,7 +212,7 @@ contract UniswapV3BuyCallback is UniswapBuyCallbackBase, IUniswapV3BuyCallback, 
 
     /// @dev Swaps the callback's whole residual balance, which also sweeps up anything an earlier
     /// fill left behind.
-    function _swapWholeResidual(address residualToken, address loanToken, Sale memory sale) internal {
+    function _swapWholeResidual(address residualToken, address loanToken, SourcingMathLib.Sale memory sale) internal {
         uint256 residual = IERC20Extended(residualToken).balanceOf(address(this));
         if (residual > 0) _swapResidual(residualToken, loanToken, residual, sale);
     }
@@ -235,7 +226,9 @@ contract UniswapV3BuyCallback is UniswapBuyCallbackBase, IUniswapV3BuyCallback, 
     /// escalation path, and burns more of the maker's position — the attack paying for itself
     /// through a different door. The protection is the cost check in `_sourceLoanToken`, on the
     /// loan token that actually arrived.
-    function _swapResidual(address residualToken, address loanToken, uint256 amountIn, Sale memory sale) internal {
+    function _swapResidual(address residualToken, address loanToken, uint256 amountIn, SourcingMathLib.Sale memory sale)
+        internal
+    {
         require(
             (residualToken == ROUTE_TOKEN0 && loanToken == ROUTE_TOKEN1)
                 || (residualToken == ROUTE_TOKEN1 && loanToken == ROUTE_TOKEN0),

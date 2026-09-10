@@ -11,6 +11,7 @@ import {IMidnightBuyCallback} from "../src/interfaces/IMidnightBuyCallback.sol";
 import {IUniswapV4BuyCallback} from "../src/interfaces/IUniswapV4BuyCallback.sol";
 import {IV4PositionManager, V4Actions, V4PositionInfo} from "../src/interfaces/IV4PositionManager.sol";
 
+import {StubPriceRef} from "./mocks/StubPriceRef.sol";
 import {V4ParkedBase} from "./V4ParkedBase.sol";
 import {IERC20Meta} from "./interfaces/IUniswapMinimal.sol";
 
@@ -163,9 +164,13 @@ contract UniswapV4NftBuyCallbackTest is V4ParkedBase {
     /// @dev Here the escalation costs a second full round-trip through the position manager, not
     /// just a second burn: two decreases, two unlocks of our own, four residual transfers. That is
     /// the non-custodial path's worst case, and it is worth seeing settle.
+    /// @dev **The reference is neutralised here**, as on the other two adapters since D8: the drift
+    /// that makes the sized burn fall short is the drift the cost guard refuses, so the mechanism
+    /// can only be exercised with the guard held open. See `UniswapV3BuyCallback.t.sol`.
     function test_escalationFinishesAFillTheFirstBurnFellShortOf() public {
+        StubPriceRef permissive = new StubPriceRef(158_456_325_028_528_675_187_087_900_672);
         UniswapV4NftBuyCallback drifted = UniswapV4NftBuyCallback(
-            factory.createCallback(maker, priceRef, MAX_SLIPPAGE_WAD, usdcUsdtRouteKey(), bytes32(uint256(7)))
+            factory.createCallback(maker, permissive, MAX_SLIPPAGE_WAD, usdcUsdtRouteKey(), bytes32(uint256(7)))
         );
         vm.prank(maker);
         IV4PositionManager(V4_POSITION_MANAGER).approve(address(drifted), tokenId);
@@ -257,7 +262,8 @@ contract UniswapV4NftBuyCallbackTest is V4ParkedBase {
     /// said ~3,950 here; that number was never reachable.
     ///
     /// @dev **D8 re-pinned this from 214.661289 to 214.128351.** Nothing about v4 changed — v4 still
-    /// values the residual at route spot until D10 wires its reference. What changed is that the
+    /// values the residual at route spot until D10 wires its reference — **D10 has now wired it**,
+    /// and the pin below moved with the fixture's budget and reference. What changed at D8 is that the
     /// bisection now searches over fill size and sizes each candidate burn through
     /// `liquidityForTarget`, the way `onBuy` does, so the 25bp impact margin is priced instead of
     /// assumed away. 0.25% of the quote, which is the margin exactly.
@@ -266,11 +272,62 @@ contract UniswapV4NftBuyCallbackTest is V4ParkedBase {
         uint128 parked = _liquidityFor(PARKED_USDC, PARKED_USDT);
         assertGt(uint256(parked) * 2, active, "the maker is no longer past the active-share cap");
 
+        // Re-pinned D10 for the same reason as the custodial twin: a real `V3TwapRef` and a 10bp
+        // budget, because the ported cost guard charges the 0.75bp basis between the route venue
+        // and the pool the reference reads. See `JOURNAL.md`.
         assertEq(
             callback.buyerAssetsBound(bytes32(0), market, maker, _callbackData()),
-            214_128351,
-            "the v4 bound moved; single-step is 245.214731, so check the walk before re-pinning"
+            3_142_708391,
+            "the v4 bound moved; check the walk and the reference basis before re-pinning"
         );
+    }
+
+    /// @dev **The v4 bound is measured against `PRICE_REF`, not against the venue it is about to
+    /// trade in** — D8's central change, ported D10. Two callbacks over the *same NFT* and the same
+    /// route venue, differing only in the reference they carry: if the bound read route spot, as it
+    /// did until today, both would answer the same number.
+    ///
+    /// @dev It lives on this adapter and not the custodial one for a concrete reason. v4 keys a
+    /// position by `owner: msg.sender`, so a second custodial callback owns nothing and its bound
+    /// is zero whatever the reference says — a version of this test written there passed under the
+    /// mutation it was supposed to catch, because the two bounds differed for the wrong reason.
+    /// Sharing one NFT is what makes the reference the only variable.
+    function test_theBoundIsMeasuredAgainstTheReferenceNotTheRouteVenue() public {
+        UniswapV4NftBuyCallback atTwap = _routedCallback(MAX_SLIPPAGE_WAD, usdcUsdtRouteKey(), 12);
+
+        // A reference that prices the residual well away from what the route venue pays. Nothing
+        // about the venue changes between the two calls, so any movement came from the reference.
+        StubPriceRef cheap = new StubPriceRef(112_045_541_949_572_287_496_682_733_568);
+        UniswapV4NftBuyCallback atStub = UniswapV4NftBuyCallback(
+            factory.createCallback(maker, cheap, MAX_SLIPPAGE_WAD, usdcUsdtRouteKey(), bytes32(uint256(13)))
+        );
+
+        uint256 atReference = atTwap.buyerAssetsBound(bytes32(0), market, maker, _callbackData());
+        uint256 atOther = atStub.buyerAssetsBound(bytes32(0), market, maker, _callbackData());
+
+        assertGt(atReference, 0, "the reference-priced bound is zero, so the comparison is vacuous");
+        assertTrue(atReference != atOther, "the bound ignored the price reference");
+    }
+
+    /// @dev **The sandwich, on the non-custodial adapter.** `SandwichV4` drives the custodial one;
+    /// this is the same attack against the path that holds the residual between two unlocks, and it
+    /// exists because deleting only *this* adapter's cost guard left the whole suite green. The two
+    /// adapters carry the check separately, so they have to be attacked separately.
+    function test_theSandwichFailsClosedOnTheNonCustodialPathToo() public {
+        UniswapV4NftBuyCallback routed = _routedCallback(MAX_SLIPPAGE_WAD, usdcUsdtRouteKey(), 11);
+        vm.prank(maker);
+        IV4PositionManager(V4_POSITION_MANAGER).approve(address(routed), tokenId);
+
+        uint128 liquidityBefore = _liquidity();
+
+        _drainRouteVenue(ROUTE_DRAIN);
+
+        vm.expectPartialRevert(IMidnightBuyCallback.SourcingCostAboveBudget.selector);
+        vm.prank(MIDNIGHT);
+        routed.onBuy(bytes32(0), market, 400e6, 0, 0, maker, _callbackData());
+
+        assertEq(_liquidity(), liquidityBefore, "the attacked settlement moved the position");
+        assertEq(IERC20Meta(USDT).balanceOf(address(routed)), 0, "residual stranded on the callback");
     }
 
     /// @dev A second callback over the same NFT, differing only in budget and route venue. Possible

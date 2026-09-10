@@ -267,8 +267,27 @@ The dust grief, measured; and licensing closed. **197/197.**
   D3's escalation ceiling leaves every D9 test green, because D8's cost guard catches it *at 1bp*.
   At 100bp it does not, and the one-wei kill returns. The two defences overlap; they are not one.
 
-**Next:** D10 — port the grief test and the D8 fix to v4, add `TruncatedOracleRef`, hook address
-mining, and run the D7 attack against both references.
+## D10 — in progress
+
+First half done: **the v4 fix, and the attack that proves it.** 201/201.
+
+- **D8's cost guard ported to both v4 adapters**, bound and settlement. `SourcingMathLib.Sale` moved
+  out of the v3 adapter to serve all three.
+- **D7's sandwich ported to v4** (`SandwichV4.t.sol`, plus one on the non-custodial path). The
+  unguarded twin burns **exactly twice** the honest liquidity — the escalation ceiling hit precisely,
+  the same signature D7 measured on v3. Guarded, it fails closed and the position is untouched.
+- **The finding: a budget has to cover the basis, not just the execution.** The reference venue and
+  the route venue are **0.75bp apart while both sit at tick 7** — a tick is a basis point wide and a
+  mean-tick reference is quantised to its boundary. A 1bp maker can only route on the venue they
+  reference; v3 passes at 1bp because its route pool *is* its reference pool. v4 fixtures moved to
+  10bp and a real `V3TwapRef` in place of a stub pinned at parity.
+- **The v4 bound under-promises by 3.1%** (3,142.708391 quoted, 3,242.208926 settleable) — verified
+  by bisection rather than re-pinned on faith. Safe direction; v3 stays exact.
+- Three mutations, all now killed. Two of them initially survived, including a test that passed
+  under the very mutation it was written for — see `JOURNAL.md`.
+
+**Still to do on D10:** `TruncatedOracleRef` against OpenZeppelin's `uniswap-hooks`, hook address
+mining, and the D7 attack run against both references.
 
 Build order is **v3 first, v4 second, both shipped**. v3 is load-bearing — its native
 `observe()` makes the price-reference work straightforward. If a day goes missing, v4 is cut,
