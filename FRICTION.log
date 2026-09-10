@@ -199,3 +199,21 @@ part that makes the feedback actionable and the part that is impossible to recon
     or a guard reasoning about execution quality wants the average price of its own fill, and has
     to reconstruct it. Same gap the `minOut` pattern papers over off-chain.
     (cost: ~10m)
+
+2026-09-10 12:15  [tooling]  the D6 rate-limit fix was only half of it, and the throttle knobs
+    are not where the config lives.
+    D6 stopped CI racing itself (`push` and `pull_request` both firing for a branch with an open
+    PR). D7 hit HTTP 429 again on a *single* job: adding four fork tests that each snapshot,
+    take, and walk the route book pushed one run's distinct cold storage reads over the public
+    Base endpoint on its own. Same symptom as before — `failed to get storage for 0xD56d…` — and
+    still nothing near the top of the message names a rate limit. Worth noting the shape for
+    FEEDBACK.md: the honest bound is the one that reads the book, reading the book is what makes a
+    quoter RPC-expensive, and the cost lands on *anyone forking to test an integration*, not just
+    on the quoter's own users.
+    Then the mitigation cost its own detour. `--compute-units-per-second` and
+    `--fork-retry-backoff` are `forge test` CLI flags only; putting them under `[profile.ci]` in
+    `foundry.toml` emits "Found unknown `compute_units_per_second` config for profile `ci`" and is
+    otherwise ignored (forge 1.5.1). Fork settings that *are* toml keys sit right next to ones
+    that are not, and the warning only appears if you happen to run `forge config` — `forge test`
+    accepts the file silently and runs unthrottled. Moved to the workflow's `run:` line.
+    (cost: ~15m)

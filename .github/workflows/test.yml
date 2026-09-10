@@ -57,9 +57,22 @@ jobs:
           key: rpc-base-50875000-${{ github.run_id }}
           restore-keys: rpc-base-50875000-
 
+      # `--compute-units-per-second` and `--fork-retry-backoff` are for the *fallback* endpoint.
+      # With no `BASE_RPC_URL` secret the suite runs against the public `mainnet.base.org`, which
+      # rate-limits (HTTP 429, "over rate limit") before it finishes. D6 hit that and fixed the
+      # half that was self-inflicted — two concurrent jobs racing on one commit. D7 hit it again
+      # with a single job: a suite that walks the tick book touches enough distinct cold storage
+      # slots to go over on its own. Foundry's default is 330 CUPS, tuned for a paid provider
+      # plan, so it is throttled here and given a real backoff to retry into.
+      #
+      # They are CLI flags, not `foundry.toml` keys — setting them under `[profile.ci]` warns
+      # "Found unknown config" and is silently ignored (forge 1.5.1).
+      #
+      # Mitigation, not a fix. The fix is a private endpoint in the `BASE_RPC_URL` repo secret;
+      # see the Build section of CLAUDE.md.
       - name: Run Forge tests
         env:
           # Optional. Unset (or empty, which is what a missing secret expands to) falls back to
           # the public Base endpoint — see ForkBase._baseRpcUrl.
           BASE_RPC_URL: ${{ secrets.BASE_RPC_URL }}
-        run: forge test -vvv
+        run: forge test -vvv --compute-units-per-second 60 --fork-retry-backoff 10
