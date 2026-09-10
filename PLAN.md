@@ -250,7 +250,8 @@ The dust grief, measured; and licensing closed. **197/197.**
   9,977 wei at 1bp, 999 at 10bp, 102 at 100bp — inversely proportional, with one wei of rounding as
   the constant. **No configured minimum**, and the D3 reasoning now has a measurement under it.
 - **The grief is uneconomic from the attacker's side.** One 10 USDC unbuffered take destroys 648 wei
-  of maker value and costs 565,589 gas. Breakeven is **0.00034 gwei**.
+  of maker value and costs 565,589 gas (forge 1.5.1; 586,929 on 1.8.1 — the assertion is a floor,
+  not a pin, see `JOURNAL.md`). Breakeven is **0.00034 gwei**.
 - **Licensing closed.** Root `LICENSE` (GPL-2.0-or-later, forced by the Morpho periphery fork), and
   `script/check-licenses.sh` in CI proving all 29 dependency imports are MIT or GPL-2.0-or-later —
   nothing BUSL-1.1 compiles into this project. Risk #4 is retired.

@@ -1371,3 +1371,22 @@ v4-core imports only.
 
 This is a change to the D10 plan, made on D9 as scheduled, and the reason it was scheduled before
 D10 rather than during it.
+
+## 2026-09-10 (D9) — Absolute gas is not a pinnable number
+
+The first CI run of D9 failed on one assertion: `gas per dust take: 586,929 !~= 565,589`. Not a
+rate limit, not a fork difference — **forge 1.8.1 on the runner against 1.5.1 locally**, disagreeing
+by 3.8% about the same call, against the same fork, at the same block.
+
+Gas is a property of the toolchain as much as of the contract. Pinning it turns a runner upgrade
+into a red suite for a reason nobody should care about, and the temptation then is to widen the
+tolerance until it stops complaining, which quietly retires the assertion.
+
+The assertion is a **floor** instead — the attacker's per-take gas must stay above 500,000. That is
+also the only direction the argument needs: the claim is that griefing costs the attacker far more
+than it costs the maker, and more gas only strengthens it. Both measured figures stay in the
+docstring, attributed to the version that produced them.
+
+The general rule, since this will come up again on D11's gas table: **pin what the contract decides,
+bound what the toolchain decides.** Bounds, fills, prices and costs are exact and stay exact. Gas
+gets a floor or a ceiling in whichever direction the claim runs.

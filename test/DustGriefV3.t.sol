@@ -182,9 +182,16 @@ contract DustGriefV3Test is MidnightMarketBase {
 
     /// @dev **The grief priced from the attacker's side.** It is not free to them: one unbuffered
     /// 10 USDC take destroys **648 wei of USDC** of the maker's value and costs the attacker
-    /// **565,589 gas** — a full unwind, burn and collect and swap, every time. Griefing means one
-    /// transaction per take, so every take pays cold storage; this is measured that way rather
-    /// than amortised across a loop, which would read ~297k and flatter the attacker.
+    /// **565,589 gas** (forge 1.5.1; 586,929 on 1.8.1) — a full unwind, burn and collect and swap,
+    /// every time. Griefing means one transaction per take, so every take pays cold storage; this
+    /// is measured that way rather than amortised across a loop, which would read ~297k and
+    /// flatter the attacker.
+    ///
+    /// @dev The gas assertion is a **floor, not a pin**, and the two figures above are why: forge
+    /// 1.5.1 and 1.8.1 disagree by 3.8% on the same call against the same fork at the same block.
+    /// Absolute gas is a property of the toolchain as much as of the contract, so pinning it makes
+    /// the suite fail on a runner upgrade for no reason anyone should care about. A floor is also
+    /// the only direction the argument needs: more gas for the attacker only strengthens it.
     ///
     /// @dev Breakeven is the gas price at which those two are equal: 648 wei of USDC against
     /// 565,589 gas is about **0.00034 gwei** with ETH at $3,400. Base clears one to two orders of
@@ -201,7 +208,7 @@ contract DustGriefV3Test is MidnightMarketBase {
         midnight.take(_offer(VOLUME), hex"", 10e6, taker, taker, address(0), hex"");
         uint256 gasUsed = gasBefore - gasleft();
 
-        assertApproxEqAbs(gasUsed, 565_589, 2_000, "gas per dust take");
+        assertGt(gasUsed, 500_000, "a dust take got cheap enough to be worth repeating");
         assertApproxEqAbs(_bleed(before), 648, 40, "value destroyed per dust take");
 
         // The breakeven gas price, with ETH at $3,400: below it the grief is cheaper for the
