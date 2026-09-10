@@ -81,27 +81,37 @@ contract UniswapV4NftBuyCallback is UniswapV4BuyCallbackBase {
             position.loanIsCurrency0,
             shortfall
         );
-        _decreaseAndSell(tokenId, position, loanToken, burn);
+        SourcingMathLib.Sale memory sale;
+        _decreaseAndSell(tokenId, position, loanToken, burn, sale);
 
         uint256 sourced = IERC20Extended(loanToken).balanceOf(address(this)) - heldBefore;
 
         // Same bounded escalation as the other two adapters.
         uint256 ceiling = SourcingMathLib.escalationCeiling(burn, position.available);
         if (sourced < shortfall && ceiling > burn) {
-            _decreaseAndSell(tokenId, position, loanToken, uint128(ceiling - burn));
+            _decreaseAndSell(tokenId, position, loanToken, uint128(ceiling - burn), sale);
             sourced = IERC20Extended(loanToken).balanceOf(address(this)) - heldBefore;
         }
 
         require(sourced >= shortfall, InsufficientSourced());
+
+        // **The D8 guard, ported D10.** Same check, same place in the sequence, as the other two
+        // adapters — see `UniswapV4BuyCallback._settleFill` for why it sits after the escalation.
+        uint256 cost = SourcingMathLib.costWad(sale.referenceValue, sale.proceeds, sourced);
+        require(cost <= MAX_SLIPPAGE_WAD, SourcingCostAboveBudget(cost, MAX_SLIPPAGE_WAD));
     }
 
     /// @dev Both phases of one round: decrease through the position manager, then sell what it
     /// handed over. Split out because the escalation path runs it a second time.
-    function _decreaseAndSell(uint256 tokenId, PositionState memory position, address loanToken, uint128 liquidity)
-        internal
-    {
+    function _decreaseAndSell(
+        uint256 tokenId,
+        PositionState memory position,
+        address loanToken,
+        uint128 liquidity,
+        SourcingMathLib.Sale memory sale
+    ) internal {
         _decrease(tokenId, position.key, liquidity);
-        _sellHeldResidual(position.residualCurrency, loanToken);
+        _sellHeldResidual(position.residualCurrency, loanToken, sale);
     }
 
     /// @dev Everything about the parked position, read from the position manager rather than
@@ -136,11 +146,23 @@ contract UniswapV4NftBuyCallback is UniswapV4BuyCallbackBase {
     /// @dev Sells whatever residual this contract is holding, in its own unlock. Unlike the
     /// custodial adapter, the residual really is held here between the two phases — that is the
     /// difference the two adapters exist to measure.
-    function _sellHeldResidual(Currency residualCurrency, address loanToken) internal {
+    /// @dev The sale totals come back through the unlock's **return value** rather than by
+    /// threading a memory struct in. They have to: `unlock` re-enters this contract as a fresh
+    /// external call, so the `Sale` the caller is accumulating into is not reachable from inside
+    /// it. `unlockCallback` already returns bytes and `PoolManager.unlock` already hands them back,
+    /// so the channel exists — the alternative would be transient storage, which is state where
+    /// none is needed.
+    function _sellHeldResidual(Currency residualCurrency, address loanToken, SourcingMathLib.Sale memory sale)
+        internal
+    {
         uint256 residual = IERC20Extended(Currency.unwrap(residualCurrency)).balanceOf(address(this));
         if (residual == 0) return;
 
-        IPoolManager(POOL_MANAGER).unlock(abi.encode(residualCurrency, residual, loanToken));
+        bytes memory result = IPoolManager(POOL_MANAGER).unlock(abi.encode(residualCurrency, residual, loanToken));
+        SourcingMathLib.Sale memory leg = abi.decode(result, (SourcingMathLib.Sale));
+
+        sale.referenceValue += leg.referenceValue;
+        sale.proceeds += leg.proceeds;
     }
 
     /// @inheritdoc UniswapV4BuyCallbackBase
@@ -148,7 +170,8 @@ contract UniswapV4NftBuyCallback is UniswapV4BuyCallbackBase {
         (Currency residualCurrency, uint256 amountIn, address loanToken) =
             abi.decode(data, (Currency, uint256, address));
 
-        _swapResidual(residualCurrency, amountIn);
+        SourcingMathLib.Sale memory sale;
+        _swapResidual(residualCurrency, amountIn, sale);
 
         // Pay the swap's input out of the tokens the decrease handed over, and take the proceeds.
         IPoolManager(POOL_MANAGER).sync(residualCurrency);
@@ -157,7 +180,7 @@ contract UniswapV4NftBuyCallback is UniswapV4BuyCallbackBase {
 
         _takeAllTo(Currency.wrap(loanToken), address(this));
 
-        return "";
+        return abi.encode(sale);
     }
 
     /// QUOTING ///

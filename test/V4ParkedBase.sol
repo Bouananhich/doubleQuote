@@ -14,7 +14,7 @@ import {Vm} from "forge-std/Vm.sol";
 
 import {ForkBase} from "./ForkBase.sol";
 import {IERC20Meta, IPermit2} from "./interfaces/IUniswapMinimal.sol";
-import {StubPriceRef} from "./mocks/StubPriceRef.sol";
+import {V3TwapRef} from "../src/price-refs/V3TwapRef.sol";
 import {V4PoolPusher} from "./mocks/V4PoolPusher.sol";
 
 /// @notice What both v4 suites start from: the real USDC/USDT 0.01% v4 pool, a range around the
@@ -34,8 +34,10 @@ abstract contract V4ParkedBase is ForkBase {
     using StateLibrary for IPoolManager;
     using PoolIdLibrary for PoolKey;
 
-    /// @dev 1 bp. Held but not yet read by either adapter; D8 wires it in.
-    uint256 internal constant MAX_SLIPPAGE_WAD = 0.0001e18;
+    uint256 internal constant MAX_SLIPPAGE_WAD = 0.001e18;
+
+    /// @dev 30 minutes, same window as the v3 suites.
+    uint32 internal constant REF_WINDOW = 1800;
 
     /// @dev `Transfer(address,address,uint256)`.
     bytes32 internal constant TRANSFER_TOPIC = 0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef;
@@ -48,7 +50,7 @@ abstract contract V4ParkedBase is ForkBase {
     uint256 internal constant PARKED_USDT = 2_000e6;
 
     address internal maker = makeAddr("maker");
-    StubPriceRef internal priceRef;
+    V3TwapRef internal priceRef;
     Market internal market;
 
     PoolKey internal poolKey;
@@ -58,7 +60,7 @@ abstract contract V4ParkedBase is ForkBase {
     function setUp() public virtual override {
         super.setUp();
 
-        priceRef = new StubPriceRef(1 << 96);
+        priceRef = new V3TwapRef(POOL_USDC_USDT_100, REF_WINDOW);
         poolKey = usdcUsdtKey();
 
         (, int24 tick,,) = IPoolManager(V4_POOL_MANAGER).getSlot0(poolKey.toId());

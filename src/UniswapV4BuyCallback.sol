@@ -131,18 +131,27 @@ contract UniswapV4BuyCallback is UniswapV4BuyCallbackBase {
             parked.key, parked.tickLower, parked.tickUpper, available, loanIsCurrency0, shortfall
         );
 
-        _burnAndSell(parked, residualCurrency, burn);
+        SourcingMathLib.Sale memory sale;
+        _burnAndSell(parked, residualCurrency, burn, sale);
         uint256 sourced = _positiveDelta(loanCurrency);
 
         // The sizing models the route fee but not price impact, so it can fall short on a thin
         // venue. Escalate, but only within a bounded multiple of what the fill itself justified.
         uint256 ceiling = SourcingMathLib.escalationCeiling(burn, available);
         if (sourced < shortfall && ceiling > burn) {
-            _burnAndSell(parked, residualCurrency, uint128(ceiling - burn));
+            _burnAndSell(parked, residualCurrency, uint128(ceiling - burn), sale);
             sourced = _positiveDelta(loanCurrency);
         }
 
         require(sourced >= shortfall, InsufficientSourced());
+
+        // **The D8 guard, ported D10.** Checked once over both swaps, against the same
+        // cost-over-sourced ratio `buyerAssetsBound` bisects on, and after the escalation rather
+        // than between the two: the budget is a statement about what the unwind cost in total, so a
+        // first swap that came in expensive can still settle honestly if the second is cheap.
+        // Reverting here rolls the whole unlock back, so nothing is spent finding that out.
+        uint256 cost = SourcingMathLib.costWad(sale.referenceValue, sale.proceeds, sourced);
+        require(cost <= MAX_SLIPPAGE_WAD, SourcingCostAboveBudget(cost, MAX_SLIPPAGE_WAD));
 
         // The one token movement in the whole settlement.
         IPoolManager(POOL_MANAGER).take(loanCurrency, address(this), sourced);
@@ -150,13 +159,18 @@ contract UniswapV4BuyCallback is UniswapV4BuyCallbackBase {
 
     /// @dev Burns `liquidity` and immediately sells whatever residual that credited. Split out
     /// because the escalation path runs it a second time.
-    function _burnAndSell(Parked memory parked, Currency residualCurrency, uint128 liquidity) internal {
+    function _burnAndSell(
+        Parked memory parked,
+        Currency residualCurrency,
+        uint128 liquidity,
+        SourcingMathLib.Sale memory sale
+    ) internal {
         if (liquidity == 0) return;
 
         _modify(parked, -int256(uint256(liquidity)));
 
         uint256 residual = _positiveDelta(residualCurrency);
-        if (residual > 0) _swapResidual(residualCurrency, residual);
+        if (residual > 0) _swapResidual(residualCurrency, residual, sale);
     }
 
     /// @dev Adds liquidity and pays for it out of the maker's wallet.

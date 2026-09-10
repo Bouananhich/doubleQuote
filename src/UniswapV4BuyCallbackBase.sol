@@ -8,6 +8,7 @@ import {SafeCast} from "v4-core/libraries/SafeCast.sol";
 import {StateLibrary} from "v4-core/libraries/StateLibrary.sol";
 import {TickMath} from "v4-core/libraries/TickMath.sol";
 import {TransientStateLibrary} from "v4-core/libraries/TransientStateLibrary.sol";
+import {BalanceDelta} from "v4-core/types/BalanceDelta.sol";
 import {Currency} from "v4-core/types/Currency.sol";
 import {PoolId, PoolIdLibrary} from "v4-core/types/PoolId.sol";
 import {PoolKey} from "v4-core/types/PoolKey.sol";
@@ -93,15 +94,25 @@ abstract contract UniswapV4BuyCallbackBase is UniswapBuyCallbackBase, IUniswapV4
 
     /// SHARED SETTLEMENT PIECES ///
 
-    /// @dev Sells the residual on the route venue as an exact-input swap.
-    /// @dev No price protection, deliberately: D7's griefing test needs an unprotected version to
-    /// attack so the loss can be quantified, and D8 replaces this with a bound derived from
-    /// `PRICE_REF` and `MAX_SLIPPAGE_WAD`.
-    function _swapResidual(Currency residualCurrency, uint256 amountIn) internal {
+    /// @dev Sells the residual on the route venue as an exact-input swap, recording what the sale
+    /// was worth at `PRICE_REF` and what the venue actually paid. **D10 ports D8's guard here**;
+    /// before it, this leg had no price protection at all and v4 was still running what D7 attacked.
+    ///
+    /// @dev The sqrt-price limit stays at the extremes rather than becoming a per-swap bound, for
+    /// the same reason it does on v3: a limit produces a *partial* fill, which settlement reads as
+    /// a shortfall and answers by burning more of the position. That is the attack paying for
+    /// itself through a different door. The budget is enforced once, on realised cost, by the
+    /// caller.
+    function _swapResidual(Currency residualCurrency, uint256 amountIn, SourcingMathLib.Sale memory sale) internal {
         bool zeroForOne = residualCurrency == ROUTE_CURRENCY0;
         require(zeroForOne || residualCurrency == ROUTE_CURRENCY1, RoutePairMismatch());
 
-        IPoolManager(POOL_MANAGER)
+        // Read before the swap. `PRICE_REF` is an immutable pointing at a venue this contract is
+        // not about to trade in, so nothing the swap does can move it — but reading it first also
+        // means a reference that cannot price the pair reverts before any liquidity has moved.
+        sale.referenceValue += SourcingMathLib.valueAtRef(amountIn, _routeRefSqrtPriceX96(), zeroForOne);
+
+        BalanceDelta delta = IPoolManager(POOL_MANAGER)
             .swap(
                 routeKey(),
                 SwapParams({
@@ -111,6 +122,15 @@ abstract contract UniswapV4BuyCallbackBase is UniswapBuyCallbackBase, IUniswapV4
                 }),
                 ""
             );
+
+        // v4 signs deltas from *this contract's* perspective, the opposite of v3's convention: the
+        // output side is the positive one.
+        sale.proceeds += uint256(int256(zeroForOne ? delta.amount1() : delta.amount0()));
+    }
+
+    /// @dev The maker's reference price for the route pair, in Uniswap's canonical orientation.
+    function _routeRefSqrtPriceX96() internal view returns (uint160) {
+        return PRICE_REF.refSqrtPriceX96(Currency.unwrap(ROUTE_CURRENCY0), Currency.unwrap(ROUTE_CURRENCY1));
     }
 
     /// @dev This contract's outstanding credit in `currency`, zero if it owes rather than is owed.
@@ -191,13 +211,11 @@ abstract contract UniswapV4BuyCallbackBase is UniswapBuyCallbackBase, IUniswapV4
                 routeSqrtPriceX96: routeSqrtPriceX96,
                 routeLiquidity: IPoolManager(POOL_MANAGER).getLiquidity(routeId),
                 // **Still the route venue's own spot, and that is a dated value, not a choice.**
-                // D8 made the v3 bound reference-relative and guarded its settlement against
-                // `PRICE_REF`; porting both to v4 is D10, per the v3-first build order. Passing
-                // route spot here reproduces exactly the pre-D8 behaviour, so v4's quotes are
-                // unchanged and its numbers stay comparable — and it is the *permissive* direction,
-                // which is why it is safe to leave for a day: v4 quotes what it can source, it just
-                // does not yet refuse to source it into a manipulated book.
-                refSqrtPriceX96: routeSqrtPriceX96,
+                // **D10.** Was `routeSqrtPriceX96` — the pre-D8 behaviour, kept for a day because it
+                // errs permissive: v4 quoted what it could source, it just did not refuse to source
+                // it into a manipulated book. Now the bound is measured against the maker's
+                // reference on both venues, and settlement below enforces the same ratio.
+                refSqrtPriceX96: _routeRefSqrtPriceX96(),
                 routeFeePips: ROUTE_FEE,
                 routeBook: _routeBook(residualIsRouteToken0),
                 residualIsRouteToken0: residualIsRouteToken0,

@@ -306,3 +306,18 @@ part that makes the feedback actionable and the part that is impossible to recon
     The per-file headers are correct and complete — they are just not aggregated anywhere, and the
     one place aggregation would matter most is the transitive case.
     (cost: ~20m, plus ~30m rewriting it after the one-hop version gave a confidently wrong answer)
+
+2026-09-10 19:10  [v4]  A mean-tick TWAP is quantised to a basis point, and nothing says so.
+    Building a reference-relative slippage guard, every honest v4 fill failed a 1bp budget. The
+    cause was not impact: the v3 pool the reference reads and the v4 pool the residual sells into
+    are *both at tick 7*, and are still 0.75bp apart on price. A tick is a basis point wide, so a
+    mean-tick reference lands on the tick boundary while a venue's spot sits somewhere inside it.
+    Two venues "at the same tick" therefore agree only to within one tick, and an integrator
+    comparing a TWAP against an execution price is charging that quantisation as slippage.
+    The consequence is a floor on the smallest budget anyone can enforce against an `observe()`-
+    derived reference, and it is nowhere in the docs. `OracleLibrary.consult` returns a tick;
+    `getQuoteAtTick` converts it; neither mentions that the answer is only tick-accurate, and both
+    read as if they were giving you a price. The fix is a sentence, not code: say that a mean tick
+    is accurate to one tick spacing of the *oracle* pool and that budgets below that are not
+    meaningful.
+    (cost: ~50m, most of it spent looking for a bug in my own port)

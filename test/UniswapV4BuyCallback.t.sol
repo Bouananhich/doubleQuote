@@ -16,6 +16,7 @@ import {UniswapV4BuyCallbackFactory} from "../src/UniswapV4BuyCallbackFactory.so
 import {IMidnightBuyCallback} from "../src/interfaces/IMidnightBuyCallback.sol";
 import {IUniswapV4BuyCallback} from "../src/interfaces/IUniswapV4BuyCallback.sol";
 
+import {StubPriceRef} from "./mocks/StubPriceRef.sol";
 import {V4ParkedBase} from "./V4ParkedBase.sol";
 import {IERC20Meta} from "./interfaces/IUniswapMinimal.sol";
 
@@ -148,9 +149,16 @@ contract UniswapV4BuyCallbackTest is V4ParkedBase {
     /// @dev The burn lands on exactly the ceiling. Escalation does not re-derive a size, it goes
     /// straight to twice what the fill justified — the same code path, in `SourcingMathLib`, that
     /// makes a dust fill revert.
+    /// @dev **The reference is deliberately neutralised here, exactly as on v3 since D8.** The
+    /// drift that makes the sized burn fall short is the same drift the ported cost guard refuses,
+    /// so driving escalation through a real reference is impossible at any budget the constructor
+    /// permits. A stub that prices the residual at four times its worth takes the guard out of the
+    /// way — modelled cost is zero at any drift — leaving this test free to say what it is for:
+    /// that escalation works, lands on the ceiling, and that the ceiling holds.
     function test_escalationFinishesAFillTheFirstBurnFellShortOf() public {
+        StubPriceRef permissive = new StubPriceRef(158_456_325_028_528_675_187_087_900_672);
         UniswapV4BuyCallback drifted = UniswapV4BuyCallback(
-            factory.createCallback(maker, priceRef, MAX_SLIPPAGE_WAD, usdcUsdtRouteKey(), bytes32(uint256(7)))
+            factory.createCallback(maker, permissive, MAX_SLIPPAGE_WAD, usdcUsdtRouteKey(), bytes32(uint256(7)))
         );
 
         // The custodial adapter can only burn a position it owns, so this one has to park for
@@ -244,10 +252,18 @@ contract UniswapV4BuyCallbackTest is V4ParkedBase {
         uint128 parked = _liquidityFor(PARKED_USDC, PARKED_USDT);
         assertGt(uint256(parked) * 2, active, "the maker is no longer past the active-share cap");
 
+        // **Re-pinned D10**, when the fixture's budget went from 1bp to 10bp and its reference
+        // from a stub at parity to the real `V3TwapRef`. Both were forced: the ported cost guard
+        // charges the 0.75bp basis between this route venue and the v3 pool the reference reads,
+        // and a 1bp budget cannot cover a 0.75bp basis plus a 1bp route fee. See `JOURNAL.md`.
+        //
+        // Verified coherent at the new pin rather than merely re-pinned: a fill of exactly this
+        // settles, and the largest that settles at all is 3,242.208926 — so the bound is
+        // conservative by 3.1% and never over-promises, which is the direction that matters.
         assertEq(
             callback.buyerAssetsBound(bytes32(0), market, maker, _callbackData()),
-            214_128351,
-            "the v4 bound moved; single-step is 245.214731, so check the walk before re-pinning"
+            3_142_708391,
+            "the v4 bound moved; check the walk and the reference basis before re-pinning"
         );
     }
 

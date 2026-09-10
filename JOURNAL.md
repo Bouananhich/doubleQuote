@@ -1433,3 +1433,79 @@ test I ran was too weak to catch it**: I added a *direct* import of a BUSL file,
 check was always going to see. A mutation that only exercises the path you had in mind proves the
 code does what you meant, not what you claimed. The replacement is mutated by reaching a BUSL file
 that is genuinely off the expected list (`Pool.sol`), which fails, as it must.
+
+## 2026-09-10 (D10) — The v4 fix, and what porting it exposed about references
+
+D8 protected v3 and explicitly left v4 running what D7 attacked, on the grounds that route spot was
+the *permissive* direction and one day's exposure in a test suite costs nothing. Ported now: both
+v4 adapters read `PRICE_REF`, accumulate what each residual sale was worth against it, and refuse a
+settlement whose realised cost exceeds `MAX_SLIPPAGE_WAD`. `SourcingMathLib.Sale` moved out of
+`UniswapV3BuyCallback` to hold the totals for all three adapters.
+
+**The attack reproduces on v4 with the same signature it has on v3.** Front-run the route venue,
+fire the settlement, and the unguarded twin burns **exactly twice** the honest liquidity —
+80,355,823,566 against 160,711,647,132. Not approximately twice: the escalation ceiling, hit
+precisely, exactly as D7 found on v3. The maker pays in liquidity rather than in price because
+`onBuy` must deliver or revert, and that is a property of the settlement contract, not of the venue.
+
+**The non-custodial adapter needed its own attack.** The two v4 adapters carry the guard separately,
+so deleting it from `UniswapV4NftBuyCallback` alone left the whole suite green even after
+`SandwichV4` existed. Two implementations of one rule need two tests; one test and an assumption of
+symmetry is not coverage.
+
+### The finding: a slippage budget has to cover the *basis*, not just the execution
+
+Porting the guard turned every honest v4 fill red at the fixture's 1bp budget, and the reason was
+not impact. Measured at `FORK_BLOCK`:
+
+| | sqrtPriceX96 |
+|---|---|
+| reference — `V3TwapRef` mean tick on the v3 0.01% pool | 79255895837549753882639819015 |
+| v4 route/park venue spot | 79258856290041777283278632807 |
+
+**0.75bp apart, persistently.** Both pools sit at tick 7, which is exactly as close as "the same
+tick" gets you — a tick is a basis point wide, and a mean-tick reference is quantised to the tick
+boundary while a venue's spot sits somewhere inside it. Add the route fee and an honest fill costs
+more than 1bp before any impact at all.
+
+So the budget is not only an impact allowance. It has to cover **the standing basis between the
+route venue and the reference venue**, and a mean-tick reference contributes up to a tick of that on
+its own. The corollary is sharp and worth stating in the README: *a 1bp maker can only route on the
+venue they reference.* The v3 suites pass at 1bp precisely because their route pool **is** their
+reference pool, so only TWAP-versus-spot drift shows up — which reads as a validation of the 1bp
+number and is really a validation of that coincidence.
+
+The v4 fixtures now carry a 10bp budget and a real `V3TwapRef` in place of a stub pinned at parity.
+Both were forced by the port, and the stub was the larger error of the two: it asserted a price the
+market does not have, which cost 5.72bp of fictitious basis until it was replaced.
+
+### The v4 bound is conservative by 3%, and that is checked rather than assumed
+
+At the new budget the bound is **3,142.708391** and the largest fill that actually settles is
+**3,242.208926** — the bound under-promises by 3.1%. v3 is exact to the wei; v4 is not, and the
+difference is not yet explained. It is recorded rather than chased because the direction is the safe
+one: the bound never promises a fill settlement would refuse, which is the invariant that matters,
+and D11's frontier work is where tightness gets studied.
+
+What that check is really for: re-pinning a moved constant is not evidence. Before touching either
+pinned bound I bisected the largest settling fill against the quote, and the first time I ran that
+probe — at 1bp, before diagnosing the basis — it showed the bound *over*-promising and only 2 wei
+settling. Raising the budget until the suite went green would have buried exactly that.
+
+## 2026-09-10 (D10) — Three mutations, two of which I had already miscounted
+
+The v4 guard shipped green and completely untested: deleting
+`require(cost <= MAX_SLIPPAGE_WAD, ...)` from **both** adapters left 197/197 passing. Porting a fix
+without porting the attack it answers produces code that looks defended and is not.
+
+Worse, the first test written to close the second hole — that the bound reads `PRICE_REF` rather
+than route spot — **passed under the mutation it existed to catch**. It compared two custodial
+callbacks over what I thought was one position, but v4 keys a position by `owner: msg.sender`, so
+the second callback owned nothing and its bound was zero for reasons having nothing to do with the
+reference. Two numbers differed, the assertion held, and it proved nothing. It only surfaced because
+the mutation was run rather than assumed. Moved to the NFT adapter, where two callbacks genuinely
+share one `tokenId`, and it now fails as it must.
+
+Second time this week a mutation has been too weak to catch its own target — the D9 licence check
+was the first. The pattern in both: the test exercised the path I had in mind instead of the claim I
+had made. **Check that a probe fails for the reason you intend, not merely that it fails.**

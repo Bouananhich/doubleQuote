@@ -618,6 +618,17 @@ library SourcingMathLib {
         return residualIsToken0 ? quote0For1(residual, refSqrtPriceX96) : quote1For0(residual, refSqrtPriceX96);
     }
 
+    /// @notice Running totals for the residual sales one settlement makes: what they were worth at
+    /// the maker's `IPriceRef`, and what the route venue actually paid.
+    /// @dev Carried as a memory struct so a sized burn's swap and an escalation's both report into
+    /// one place, and `costWad` is then applied over the settlement rather than over whichever swap
+    /// happened last. Shared by v3 and v4: the residual sale is the one part of settlement the two
+    /// adapters do identically.
+    struct Sale {
+        uint256 referenceValue;
+        uint256 proceeds;
+    }
+
     /// @notice What an unwind cost, as a WAD fraction of what it sourced.
     ///
     /// @dev **The D8 guard, and the denominator is the whole design.** This is deliberately the
