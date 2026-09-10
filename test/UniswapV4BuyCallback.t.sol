@@ -233,6 +233,12 @@ contract UniswapV4BuyCallbackTest is V4ParkedBase {
     /// most of the venue into itself at spot, and a quote that said otherwise would hand the taker
     /// either a reverted transaction or a fill priced by the maker's own unwind. The naive bound
     /// said ~3,950 here; that number was never reachable.
+    ///
+    /// @dev **D8 re-pinned this from 214.661289 to 214.128351.** Nothing about v4 changed — v4 still
+    /// values the residual at route spot until D10 wires its reference. What changed is that the
+    /// bisection now searches over fill size and sizes each candidate burn through
+    /// `liquidityForTarget`, the way `onBuy` does, so the 25bp impact margin is priced instead of
+    /// assumed away. 0.25% of the quote, which is the margin exactly.
     function test_theBoundIsCutDownByHowMuchOfTheVenueTheMakerIs() public view {
         uint128 active = _activeLiquidity();
         uint128 parked = _liquidityFor(PARKED_USDC, PARKED_USDT);
@@ -240,7 +246,7 @@ contract UniswapV4BuyCallbackTest is V4ParkedBase {
 
         assertEq(
             callback.buyerAssetsBound(bytes32(0), market, maker, _callbackData()),
-            214_661289,
+            214_128351,
             "the v4 bound moved; single-step is 245.214731, so check the walk before re-pinning"
         );
     }

@@ -231,6 +231,10 @@ contract SourcingMathLibTest is Test {
             liquidity: LIQUIDITY,
             loanIsToken0: true,
             routeSqrtPriceX96: SQRT_PRICE_1,
+            // Equal to route spot by default, which is what keeps every number in this suite
+            // measuring the same arithmetic it did before D8. The cases where the reference and
+            // the route venue *disagree* are the new ones, and they set this explicitly.
+            refSqrtPriceX96: SQRT_PRICE_1,
             routeLiquidity: routeLiquidity,
             routeFeePips: FEE_100,
             residualIsRouteToken0: false,
@@ -711,5 +715,66 @@ contract SourcingMathLibTest is Test {
 
         assertTrue(completeA && completeB, "both books should absorb this swap");
         assertLt(conservative, exact, "the double-count is not actually costing anything, so it is untested");
+    }
+
+    /// D8 — THE REFERENCE ///
+
+    /// @dev **Cost is measured against `PRICE_REF`, not against the route venue's spot.** This is
+    /// the assertion that pins it, and it exists because nothing else in the suite could tell the
+    /// two apart: on a quiet fork the reference and the route pool agree to within a basis point,
+    /// so a mutation swapping them back failed one assertion by 0.9%. Here they are set
+    /// independently, on a book deep enough that the walk is never the binding constraint, so the
+    /// only thing moving the answer is the valuation.
+    ///
+    /// @dev The residual is token1, so `valueAtRef` divides by the price: a reference *below* route
+    /// spot says the residual is worth more than the venue will pay, which is a larger cost and a
+    /// smaller bound. Above route spot, the opposite. Valuing at route spot instead makes all three
+    /// numbers identical, which is precisely the blind spot — a manipulated venue would be pricing
+    /// its own manipulation in as the market.
+    function test_theBoundIsMeasuredAgainstTheReferenceNotTheRouteVenue() public pure {
+        uint128 deep = LIQUIDITY * 1000;
+        uint256 budget = 0.001e18;
+
+        uint256 atPar = SourcingMathLib.boundBySlippage(_params(deep, false, budget));
+
+        SourcingMathLib.BoundParams memory dearer = _params(deep, false, budget);
+        dearer.refSqrtPriceX96 = uint160((uint256(SQRT_PRICE_1) * 999) / 1000);
+        uint256 boundDearer = SourcingMathLib.boundBySlippage(dearer);
+
+        SourcingMathLib.BoundParams memory cheaper = _params(deep, false, budget);
+        cheaper.refSqrtPriceX96 = uint160((uint256(SQRT_PRICE_1) * 1001) / 1000);
+        uint256 boundCheaper = SourcingMathLib.boundBySlippage(cheaper);
+
+        // The safety direction: a reference saying the residual is worth more than this venue will
+        // pay is a larger cost, and the quote shrinks.
+        assertLt(boundDearer, atPar, "a reference dearer than the route venue did not shrink the bound");
+
+        // The other direction shrinks it too, and for a different reason worth stating outright:
+        // **the bound never promises more than the residual is worth at the maker's own
+        // reference.** `boundBySlippage` tops its search at the paper value of the burn valued at
+        // `PRICE_REF`, so when the route venue would actually pay *better* than the reference, the
+        // extra is not quoted. That is a deliberate under-promise — quoting it would mean promising
+        // to capture a favourable deviation that can disappear between the quote and the block,
+        // which is the same asynchrony the whole bound exists to be honest about.
+        assertLt(boundCheaper, atPar, "a reference cheaper than the route venue did not cap the bound");
+    }
+
+    /// @dev And the same reference drives `sourcedFor`'s cost directly, which is the term the budget
+    /// caps. Stated on the primitive as well as through the bisection, so a change to either is
+    /// caught on its own.
+    function test_sourcedForPricesTheResidualAtTheReference() public pure {
+        uint128 deep = LIQUIDITY * 1000;
+        uint128 dL = LIQUIDITY / 4;
+
+        (uint256 sourcedAtPar, uint256 costAtPar) = SourcingMathLib.sourcedFor(_params(deep, false, 1e18), dL);
+
+        SourcingMathLib.BoundParams memory dearer = _params(deep, false, 1e18);
+        dearer.refSqrtPriceX96 = uint160((uint256(SQRT_PRICE_1) * 999) / 1000);
+        (uint256 sourcedDearer, uint256 costDearer) = SourcingMathLib.sourcedFor(dearer, dL);
+
+        // The swap itself is unchanged — same venue, same book, same residual — so what the unwind
+        // *sources* cannot move. Only what it is judged to have cost.
+        assertEq(sourcedDearer, sourcedAtPar, "the reference changed what the unwind sourced");
+        assertGt(costDearer, costAtPar, "a dearer reference did not raise the measured cost");
     }
 }

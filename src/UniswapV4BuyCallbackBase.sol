@@ -190,6 +190,14 @@ abstract contract UniswapV4BuyCallbackBase is UniswapBuyCallbackBase, IUniswapV4
                 loanIsToken0: loanIsCurrency0,
                 routeSqrtPriceX96: routeSqrtPriceX96,
                 routeLiquidity: IPoolManager(POOL_MANAGER).getLiquidity(routeId),
+                // **Still the route venue's own spot, and that is a dated value, not a choice.**
+                // D8 made the v3 bound reference-relative and guarded its settlement against
+                // `PRICE_REF`; porting both to v4 is D10, per the v3-first build order. Passing
+                // route spot here reproduces exactly the pre-D8 behaviour, so v4's quotes are
+                // unchanged and its numbers stay comparable — and it is the *permissive* direction,
+                // which is why it is safe to leave for a day: v4 quotes what it can source, it just
+                // does not yet refuse to source it into a manipulated book.
+                refSqrtPriceX96: routeSqrtPriceX96,
                 routeFeePips: ROUTE_FEE,
                 routeBook: _routeBook(residualIsRouteToken0),
                 residualIsRouteToken0: residualIsRouteToken0,
