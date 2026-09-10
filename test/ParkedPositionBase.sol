@@ -12,14 +12,15 @@ import {StubPriceRef} from "./mocks/StubPriceRef.sol";
 /// @notice The scenario every v3 test starts from: a maker with a real position in the real
 /// USDC/USDT 0.01% pool, and a callback approved to unwind it.
 ///
-/// @dev One fixture, two suites — `UniswapV3BuyCallback.t.sol` drives `onBuy` directly, and
-/// `MidnightIntegration.t.sol` drives it through a real `take()`. The two ask different questions
-/// of the same setup, so the setup belongs here rather than in either of them.
+/// @dev One fixture, three suites — `UniswapV3BuyCallback.t.sol` drives `onBuy` directly, while
+/// `MidnightIntegration.t.sol` and `SandwichV3.t.sol` drive it through a real `take()` on top of
+/// `MidnightMarketBase`. They ask different questions of the same setup, so the setup belongs here
+/// rather than in any one of them.
 ///
-/// @dev What is deliberately *not* here is the `Market`. The two suites need genuinely different
-/// ones — a bare struct that is never touched on-chain versus a real market with collateral params,
+/// @dev What is deliberately *not* here is the `Market`. The suites need genuinely different ones —
+/// a bare struct that is never touched on-chain versus a real market with collateral params,
 /// created against the deployed Midnight — and collapsing them would mean the unit suite silently
-/// depending on Midnight's market rules.
+/// depending on Midnight's market rules. The real one lives in `MidnightMarketBase`.
 abstract contract ParkedPositionBase is ForkBase {
     /// @dev 1 bp. Held but not yet read by the adapter; see the note on `UniswapV3BuyCallback`.
     uint256 internal constant MAX_SLIPPAGE_WAD = 0.0001e18;
@@ -82,6 +83,26 @@ abstract contract ParkedPositionBase is ForkBase {
                 })
             );
         vm.stopPrank();
+    }
+
+    /// @dev A second callback over the same parked position, differing only in budget and route.
+    /// @dev Shared rather than per-suite: the quoting tests point one at a thinner venue to prove
+    /// park and route are independent, and the griefing suite points one at a venue an attacker can
+    /// actually afford to move.
+    function _routedCallback(uint256 budgetWad, address routePool, uint256 salt)
+        internal
+        returns (UniswapV3BuyCallback routed)
+    {
+        routed = UniswapV3BuyCallback(factory.createCallback(maker, priceRef, budgetWad, routePool, bytes32(salt)));
+    }
+
+    /// @dev ERC-721 approval is a single slot per `tokenId`, so approving one callback revokes the
+    /// last. Every use site approves at the point of use; approving inside `_routedCallback` would
+    /// silently disarm whichever callback was built first, and an `onBuy` that reverts on approval
+    /// satisfies any assertion about what it sourced by never running.
+    function _approve(UniswapV3BuyCallback routed) internal {
+        vm.prank(maker);
+        INonfungiblePositionManager(V3_POSITION_MANAGER).approve(address(routed), tokenId);
     }
 
     /// @dev What the maker's offer carries: the `tokenId` and nothing else. Everything else about

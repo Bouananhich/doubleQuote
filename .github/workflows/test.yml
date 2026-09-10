@@ -44,22 +44,50 @@ jobs:
       # without it every job re-fetches the same state at the pinned block, which is slow and
       # invites rate limiting when falling back to the public endpoint.
       #
-      # The key deliberately varies per run. actions/cache only writes a new entry when the key
+      # The key deliberately varies per run. A cache action only writes a new entry when the key
       # *missed*, so a key derived from source files would go stale the moment a test touched
       # state the cache did not already hold: the exact key still hits, nothing new is saved, and
       # every subsequent run re-fetches the same additions. Adding the v3 adapter, which mints,
       # burns and swaps on the fork, is exactly that case. A run-unique key with a shared prefix
       # restores the newest cache and always saves the superset back.
-      - name: Cache RPC responses
-        uses: actions/cache@v4
+      #
+      # **Restore and save are split on purpose.** `actions/cache`'s combined form only saves in
+      # its post step when the job *succeeded*, so a run that dies partway through fetching new
+      # state contributes nothing — which is precisely the run whose fetches are most worth
+      # keeping. D7 hit the deadlock that creates: the suite grew past what the public endpoint
+      # serves in one run, every attempt 429'd partway, none of them saved, and each retry
+      # restarted from the same stale cache. Saving with `if: always()` lets consecutive runs
+      # accumulate the new slots instead, so a suite that has outgrown one run's rate budget
+      # still converges to green over a couple of them.
+      - name: Restore RPC cache
+        uses: actions/cache/restore@v4
         with:
           path: ~/.foundry/cache/rpc
           key: rpc-base-50875000-${{ github.run_id }}
           restore-keys: rpc-base-50875000-
 
+      # Note there is no rate-limit knob to reach for here. `--compute-units-per-second` and
+      # `--fork-retry-backoff` govern the CLI `--fork-url` backend only; this suite forks from
+      # inside `setUp()` with `vm.createSelectFork`, and those forks ignore both. Measured rather
+      # than assumed: `--compute-units-per-second 1` against a cleared cache still finishes a
+      # fork test in 2.44s, which is impossible if the throttle applied. The flags also refuse to
+      # parse without `--rpc-url`, and the `foundry.toml` spelling of them warns "Found unknown
+      # config" and is ignored (forge 1.5.1) — three ways to think the suite is throttled when it
+      # is not.
+      #
+      # So the only real levers are the cache above and a private endpoint in the `BASE_RPC_URL`
+      # repo secret. See the Build section of CLAUDE.md.
       - name: Run Forge tests
         env:
           # Optional. Unset (or empty, which is what a missing secret expands to) falls back to
           # the public Base endpoint — see ForkBase._baseRpcUrl.
           BASE_RPC_URL: ${{ secrets.BASE_RPC_URL }}
         run: forge test -vvv
+
+      # `if: always()` is the whole point — see the note on the restore step.
+      - name: Save RPC cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.foundry/cache/rpc
+          key: rpc-base-50875000-${{ github.run_id }}

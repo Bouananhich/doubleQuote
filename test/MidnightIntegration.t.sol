@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 pragma solidity 0.8.34;
 
-import {IMidnight, Market, Offer, CollateralParams} from "midnight/src/interfaces/IMidnight.sol";
 import {MAX_TICK} from "midnight/src/libraries/TickLib.sol";
-import {DummyRatifier} from "midnight/test/helpers/DummyRatifier.sol";
-import {Oracle} from "midnight/test/helpers/Oracle.sol";
 
 import {INonfungiblePositionManager} from "../src/interfaces/IUniswapV3.sol";
 import {IUniswapV3BuyCallback} from "../src/interfaces/IUniswapV3BuyCallback.sol";
 
-import {ParkedPositionBase} from "./ParkedPositionBase.sol";
+import {MidnightMarketBase} from "./MidnightMarketBase.sol";
 import {IERC20Meta} from "./interfaces/IUniswapMinimal.sol";
 
 /// @notice The whole thesis in one transaction: a maker's capital sits in a Uniswap v3 LP position,
@@ -27,98 +24,11 @@ import {IERC20Meta} from "./interfaces/IUniswapMinimal.sol";
 /// the deployed one at `FORK_BLOCK` through `IMidnight` and has to live with whatever the
 /// configurator has actually enabled — which is the point of testing against it.
 ///
-/// @dev What the fork dictates, all verified at `FORK_BLOCK` rather than assumed:
-///   - **Tick spacing is not settable.** `tickSpacingSetter` is `address(0)`, so nothing can call
-///     `setMarketTickSpacing`, and the market keeps `DEFAULT_TICK_SPACING` (4). `MAX_TICK` (6744)
-///     is a multiple of 4, so the offer's tick is reachable — upstream's `setMarketTickSpacing(id,
-///     1)` has no equivalent here and no need for one.
-///   - **USDC carries no fees.** Every `defaultSettlementFeeCbp` and the `defaultContinuousFee`
-///     read zero, so `buyerAssets == sellerAssets` and a take moves exactly the loan. Asserted
-///     below rather than assumed, since a governance action could change it under a later fork
-///     block.
-///   - **LLTV `0.77e18` and liquidation cursor `0.3e18` are enabled**; `0.5e18` and `1e18` cursors
-///     are not. The market has to be built from what is enabled, not from what is convenient.
-contract MidnightIntegrationTest is ParkedPositionBase {
-    /// @dev Both enabled at `FORK_BLOCK`, and asserted so in `test_theMarketUsesEnabledParameters`.
-    uint256 internal constant LLTV = 0.77e18;
-    uint256 internal constant LIQUIDATION_CURSOR = 0.3e18;
-
-    /// @dev cbBTC has 8 decimals against USDC's 6, so one cbBTC unit is 1e-8 BTC. Priced at
-    /// $100k/BTC that is 1e3 USDC units, and Morpho-style oracles scale by `ORACLE_PRICE_SCALE`
-    /// (1e36) — hence 1e39. A stub, because the collateral leg is not what this suite is testing.
-    uint256 internal constant CBBTC_PRICE = 1e39;
-
-    address internal taker = makeAddr("taker");
-
-    IMidnight internal midnight = IMidnight(MIDNIGHT);
-    DummyRatifier internal ratifier;
-    Oracle internal oracle;
-
-    Market internal market;
-    bytes32 internal marketId;
-
-    function setUp() public override {
-        super.setUp();
-
-        ratifier = new DummyRatifier();
-        oracle = new Oracle();
-        oracle.setPrice(CBBTC_PRICE);
-
-        market.chainId = block.chainid;
-        market.midnight = MIDNIGHT;
-        market.loanToken = USDC;
-        market.maturity = block.timestamp + 30 days;
-        market.collateralParams
-            .push(
-                CollateralParams({
-                    token: CBBTC, lltv: LLTV, liquidationCursor: LIQUIDATION_CURSOR, oracle: address(oracle)
-                })
-            );
-        marketId = midnight.touchMarket(market);
-
-        // The maker's one on-chain act besides approving the NFT: letting the ratifier speak for
-        // them. Everything else about the offer is signed, not stored.
-        vm.prank(maker);
-        midnight.setIsAuthorized(address(ratifier), true, maker);
-    }
-
-    /// HELPERS ///
-
-    /// @dev The maker's offer. Buy side, so the maker is the lender and the callback sources the
-    /// loan; `tick = MAX_TICK` prices units at par, which keeps the arithmetic legible.
-    function _offer(uint256 maxUnits) internal view returns (Offer memory offer) {
-        offer.market = market;
-        offer.buy = true;
-        offer.maker = maker;
-        offer.expiry = block.timestamp + 1 days;
-        offer.tick = MAX_TICK;
-        offer.callback = address(callback);
-        offer.callbackData = _callbackData();
-        offer.ratifier = address(ratifier);
-        offer.maxUnits = uint128(maxUnits);
-        offer.continuousFeeCap = type(uint256).max;
-    }
-
-    /// @dev Collateralises the taker at twice what the LLTV strictly demands, so the health check
-    /// at the end of `take` is never the thing under test.
-    function _collateralize(uint256 debt) internal {
-        uint256 required = (debt * 1e18 / LLTV) * 1e36 / CBBTC_PRICE;
-        uint256 collateral = required * 2;
-
-        deal(CBBTC, taker, collateral);
-        vm.startPrank(taker);
-        IERC20Meta(CBBTC).approve(MIDNIGHT, collateral);
-        midnight.supplyCollateral(market, 0, collateral, taker);
-        vm.stopPrank();
-    }
-
-    function _take(uint256 units) internal returns (uint256 buyerAssets, uint256 sellerAssets) {
-        vm.prank(taker);
-        return midnight.take(_offer(units), hex"", units, taker, taker, address(0), hex"");
-    }
-
+/// @dev The market, the ratifier, the offer and the taker moved to `MidnightMarketBase` on D7, when
+/// `SandwichV3.t.sol` needed the same harness. The fork assumptions they rest on are asserted at
+/// the bottom of this file, which is where they were found.
+contract MidnightIntegrationTest is MidnightMarketBase {
     /// THE DELIVERABLE ///
-
     /// @dev Park, offer, take, settle. The maker never moves the capital out of Uniswap to make
     /// the offer and never touches the transaction that fills it.
     function test_aTakeSourcesTheLoanFromTheParkedPosition() public {

@@ -165,3 +165,74 @@ part that makes the feedback actionable and the part that is impossible to recon
     RPC-expensive rather than gas-expensive. An official `view` quoter that walks ticks without
     simulating-and-reverting would be the thing that makes this cheap for everyone.
     (cost: ~10m, all of it diagnosis)
+
+2026-09-10 11:05  [v3 / v4-core]  `slot0` and a realised fill price are quoted in opposite
+    directions, and getting it wrong manufactures exactly the bug you are hunting.
+    Measuring what the callback's residual sale actually got, to compare against the maker's
+    slippage budget. The realised price falls out of the swap as `amountOut / amountIn` — USDC per
+    USDT here, i.e. token0 per token1. `slot0`'s `sqrtPriceX96` is token1 per token0. They are
+    reciprocals, so a direct comparison is wrong by construction, and the failure is quiet: an
+    honest unattacked fill reported a 22.67bp deviation against a 10bp budget instead of its real
+    8.13bp. That is a plausible-looking budget breach in a test suite whose entire purpose is
+    finding budget breaches, so it reads as a finding rather than as a unit error. It only came
+    apart because the attacked number, 61.34%, matched the independently-measured 61.86% loss and
+    the honest one matched nothing.
+    Not a bug in Uniswap — the orientation is documented and consistent. The friction is that
+    nothing in the type system distinguishes the two, both are `uint256` WADs near 1e18 for a
+    stable pair, and the sign of the error is small for small moves, so it survives a smoke test.
+    A `sqrtPriceX96 -> price` helper in the periphery libraries taking the desired orientation as
+    an argument would be the fix; every integrator writes this by hand today. Ended up routing both
+    venues through a single `_priceOfResidual` so the inversion cannot be applied to one side of a
+    comparison and not the other.
+    (cost: ~25m)
+
+2026-09-10 11:30  [v3]  there is no way to ask a pool what price a swap just executed at.
+    Wanted the blended realised price over a settlement that hits the route venue twice (a sized
+    burn plus an escalation). The `Swap` event carries per-swap amounts, so it means decoding two
+    events and summing them; `slot0` after the fact gives the *ending* price, not the average, and
+    for a swap that walks several ticks those differ by the whole point of the measurement.
+    Settled on reading the pool's ERC-20 balances before and after the take and dividing, which is
+    exact and aggregates naturally, but only works because nothing else moves that pool's balances
+    inside the transaction — true here since park and route are different pools, and quietly false
+    for any maker who routes through the venue they park in.
+    The general shape: v3 tells you where the price *is* and what each swap *did*, but a callback
+    or a guard reasoning about execution quality wants the average price of its own fill, and has
+    to reconstruct it. Same gap the `minOut` pattern papers over off-chain.
+    (cost: ~10m)
+
+2026-09-10 12:15  [tooling]  the D6 rate-limit fix was only half of it, and the throttle knobs
+    are not where the config lives.
+    D6 stopped CI racing itself (`push` and `pull_request` both firing for a branch with an open
+    PR). D7 hit HTTP 429 again on a *single* job: adding four fork tests that each snapshot,
+    take, and walk the route book pushed one run's distinct cold storage reads over the public
+    Base endpoint on its own. Same symptom as before — `failed to get storage for 0xD56d…` — and
+    still nothing near the top of the message names a rate limit. Worth noting the shape for
+    FEEDBACK.md: the honest bound is the one that reads the book, reading the book is what makes a
+    quoter RPC-expensive, and the cost lands on *anyone forking to test an integration*, not just
+    on the quoter's own users.
+    Then the mitigation turned out not to exist, in three layers. `compute_units_per_second` and
+    `fork_retry_backoff` under `[profile.ci]` emit "Found unknown config" and are ignored (forge
+    1.5.1) — and only `forge config` prints that warning, `forge test` accepts the file silently
+    and runs unthrottled. As CLI flags they refuse to parse without an accompanying `--rpc-url`,
+    which this suite has no use for because it forks from inside `setUp()`. And with `--rpc-url`
+    supplied to satisfy the parser, they still do nothing: **`--compute-units-per-second 1`
+    against a cleared cache finishes a fork test in 2.44s**, so the throttle plainly does not
+    reach forks created by `vm.createSelectFork`. Three ways to believe a suite is rate-limited
+    when it is not, and the only one that says anything out loud says it in a different command.
+    The knob a cheatcode-forking suite actually needs — throttle *this* fork — has no spelling.
+    (cost: ~45m)
+
+2026-09-10 12:50  [tooling]  `actions/cache` will not save from a failing job, which is the one
+    whose fetches are worth keeping.
+    The combined `actions/cache@v4` only writes its entry in the post step when the job
+    *succeeded*. For a fork suite priming an RPC cache that is exactly backwards: the run that
+    dies partway through fetching new state is the run that fetched the most new state. D7 hit the
+    deadlock — the suite had grown past what the public endpoint serves in one run, every attempt
+    429'd partway, none of them saved, and each retry restarted from the same stale cache. A green
+    suite locally, a permanently red CI, and re-running never converges.
+    Split into `actions/cache/restore` plus `actions/cache/save` with `if: always()` and
+    consecutive runs accumulate instead. Worth knowing before you conclude the endpoint is simply
+    too small: it may be that nothing you fetch is ever being kept. `save-always` used to express
+    this on the combined action and was deprecated without the docs foregrounding the split as its
+    replacement for this case.
+    (cost: ~20m)

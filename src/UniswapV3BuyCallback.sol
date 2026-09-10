@@ -49,9 +49,16 @@ import {TickBookLib} from "./libraries/TickBookLib.sol";
 ///
 /// @dev **Knowingly incomplete in one way still.** The residual swap runs with **no price
 /// protection at all** — no `minOut`, and a sqrt-price limit set to the extremes. `PRICE_REF` and
-/// `MAX_SLIPPAGE_WAD` are held as immutables here and not yet read. That is scheduled, not
-/// overlooked: D7's griefing test needs an unprotected version to attack so the loss can be
-/// quantified, and D8 then wires the reference in and re-runs the same test.
+/// `MAX_SLIPPAGE_WAD` are held as immutables here and not yet read.
+///
+/// @dev D7 measured what that costs, in `test/SandwichV3.t.sol`: sandwiching a 5,000 USDC fill on a
+/// route venue an attacker can afford to move takes **61.86% of the fill** out of the maker's
+/// position. The maker pays in *liquidity* rather than in price — `_sourceLoanToken` must deliver
+/// the shortfall or revert, so a residual that fetches less does not settle for less, it escalates
+/// the burn until the loan is covered, and lands on exactly the ceiling. D8 derives a `minOut` from
+/// `PRICE_REF` and checks the swap's actual output against it. Comparing the route pool's `slot0`
+/// to the reference instead would not work: the front-run displaces spot by 7.70bp, inside a 10bp
+/// budget, while the realised price deviates by 61.34%.
 ///
 /// @dev **The two halves are modelled differently, on purpose.** `buyerAssetsBound` simulates the
 /// whole unwind and bisects for the largest honest fill — it is a `view`, so it can. The burn
@@ -221,8 +228,9 @@ contract UniswapV3BuyCallback is UniswapBuyCallbackBase, IUniswapV3BuyCallback, 
                 address(this),
                 zeroForOne,
                 amountIn.toInt256(),
-                // No protection. D8 replaces this with a bound derived from `PRICE_REF` and
-                // `MAX_SLIPPAGE_WAD`; D7 first measures what an attacker extracts through it.
+                // No protection. D8 replaces this with a `minOut` derived from `PRICE_REF` and
+                // `MAX_SLIPPAGE_WAD`, checked on the amount actually received. D7 measured what an
+                // attacker extracts through it: 61.86% of the fill. See `test/SandwichV3.t.sol`.
                 zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1,
                 ""
             );
