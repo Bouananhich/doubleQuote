@@ -1509,3 +1509,107 @@ share one `tokenId`, and it now fails as it must.
 Second time this week a mutation has been too weak to catch its own target — the D9 licence check
 was the first. The pattern in both: the test exercised the path I had in mind instead of the claim I
 had made. **Check that a probe fails for the reason you intend, not merely that it fails.**
+
+## 2026-09-10 (demo) — Offers are signed after all, and there is a public orderbook
+
+Two things I got wrong while scoping the demo, both corrected by the maker pointing at Morpho's own
+app, and both worth recording because the wrong version was *plausible*.
+
+**"`take` carries no signature."** True of the function signature, and false about the protocol.
+`take(Offer, bytes ratifierData, ...)` has no signature parameter, so reading the interface alone
+suggests offers cannot be signed. They are: the signature travels in `ratifierData` and is verified
+by the ratifier the offer names. Morpho operates a canonical one — **`EcrecoverRatifier` at
+`0xd6e70365C8E8DDa9a4ca662C07bbE663b017755E`**, 4,139 bytes, live on Base — so the demo needs no
+authorisation contract of its own and `script/DemoRatifier.sol` is scaffolding I wrote for a problem
+that did not exist.
+
+The scheme signs an **EIP-712 hash of a Merkle root of offers**, which is a better design than the
+one I assumed: one signature authorises a whole book, and `cancelRoot` retires all of it in one
+transaction. A single offer is the degenerate case — empty proof, `leafIndex` 0, root equal to the
+offer hash. `test/DemoPreflight.t.sol` now settles a signed 10 USDC fill through the deployed
+ratifier on a fork.
+
+**"There is no orderbook to submit to."** Also wrong. `https://api.morpho.org/v0/midnight/` serves
+`/markets` and `/books`, and `/books` returns real aggregated depth — bids and asks by tick, with
+counts — which is what the app renders. The docs describe "Router mempool rules" and note that "the
+Router checks before indexing an offer". So the whitelisting question I declared moot is real and
+still open: *will the Router index an offer naming an unknown callback?* Worth probing, and the
+answer is `FEEDBACK.md` material either way.
+
+What misled me was a docs sentence — "Midnight does not broadcast offers itself, they circulate
+through external channels" — which is a statement about the **core protocol**, not about whether
+Morpho runs an indexer. I generalised from the contract interface plus one sentence, and both were
+locally accurate. The tell I ignored: my own earlier search result contained the phrase "mempool
+validation", and I read past it because it did not fit the conclusion I had already drawn.
+
+**The demo is better for it.** It now uses a real market (cbBTC/USDC, 86% LLTV, the real
+`0x663BECd1…` oracle, December 2026 maturity, taken from Morpho's own limit-order POC) and Morpho's
+real ratifier, instead of a stub oracle and a bespoke ratifier I invented. Two fakes removed.
+
+## 2026-09-10 (demo) — The first Midnight source we compile rather than bind
+
+Every Midnight dependency so far has been an interface or a small library, which is why the
+single-profile promise in `CLAUDE.md` held: bind the deployed contracts, never compile them.
+`HashLib` breaks that. It is needed to construct an offer hash, and it does not fit in the stack
+without the IR pipeline — Midnight's own `foundry.toml` sets `via_ir = true`, and ours deliberately
+does not.
+
+Resolved with a **path-scoped** restriction rather than a global setting:
+
+```toml
+[[profile.default.additional_compiler_profiles]]
+name = "midnight-ir"
+via_ir = true
+
+[[profile.default.compilation_restrictions]]
+paths = "lib/midnight/src/ratifiers/**"
+via_ir = true
+```
+
+Everything else still compiles under one profile with no IR, so the promise holds where it was
+actually load-bearing — the adapters, the libraries, the price refs. Only the one imported path that
+cannot compile any other way is exempt, and it is Midnight's code rather than ours.
+
+Worth noting the shape of it for `FEEDBACK.md`: an integrator can bind Midnight through interfaces
+on their own compiler settings right up until they need to **construct or verify an offer**, at
+which point they inherit Midnight's. That is a surprising place for a compiler dependency to appear,
+and nothing signposts it.
+
+## 2026-09-11 (artifacts) — Two tracks, one deliverable, and the Arc calendar
+
+Submitting to **both** the Uniswap Foundation track and Circle's Arc track. They want different
+things, and the honest answer to that is not to build two projects.
+
+The Uniswap track's requirements are hard gates: a public repo, a `FEEDBACK.md`, and a README that
+"clearly points to the relevant contracts and lines of code so we can verify your integration".
+The README now carries a claim → file → line table for every Uniswap surface this project touches,
+built by grepping the actual call sites rather than from memory, and every line anchor in both
+documents was verified against the file before it shipped.
+
+`FEEDBACK.md` was rewritten from scratch. The old one was D1-era speculation whose own header said
+it should not ship unverified — and one of its six claims (the truncated-oracle sample being
+`UNLICENSED` on a side branch) had since been superseded by the real finding: the sample was
+**deleted** from `v4-periphery` entirely. Shipping the old file would have meant shipping a
+confidently wrong claim to the people who own the repo. The new file is 19 findings, each one
+traceable to a `FRICTION.log` entry written in the moment, with a file, a line and a time cost.
+
+**The Arc decision.** Arc public mainnet opens **16 Sep**; the submission deadline is **13 Sep**.
+The prize structure happens to fit that gap rather than fight it — the judged portion is the
+submission, and the conditional tranche is explicitly for being "deployed to Arc Mainnet by
+September 30", a window that opens after we submit.
+
+Arc *testnet* was the tempting shortcut and it does not work. Probed it directly rather than
+trusting the announcements: `eth_getCode` against `rpc.testnet.arc.network` returns code for USDC,
+Permit2 and Multicall3, and **nothing** for Uniswap v4, Uniswap v3, Morpho or Midnight. There is no
+pool to park in and no book to quote to. A deployment there would be a contract that cannot be
+called — a green checkmark standing in for a working system.
+
+So: the demo stays on Base, where all three protocols are real, and `ARC.md` states what is
+deployed, what is not, and why, including the fact that the reference-venue question on Arc is
+genuinely open until we see what ships at launch. A judge should not have to discover that by
+reading the code.
+
+The thing that made this cheap is that it *is* a redeploy rather than a port. The adapters take
+park, route and reference as constructor immutables and bind every venue through an interface, so
+"which chain" was never a property of the contracts. That was a safety decision (invariant 3, the
+safety envelope) and it paid a portability dividend nobody designed it for.

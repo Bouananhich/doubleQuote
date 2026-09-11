@@ -24,3 +24,17 @@ verbosity = 3
 [fmt]
 line_length = 120
 wrap_comments = true
+
+# `HashLib` is the first Midnight source this project compiles rather than merely binds through an
+# interface, and it does not fit in the stack without the IR pipeline — Midnight's own foundry.toml
+# sets `via_ir = true`. Restricting the setting to that one path keeps the single-profile promise
+# for everything else. See JOURNAL.md and FEEDBACK.md.
+[[profile.default.additional_compiler_profiles]]
+name = "midnight-ir"
+via_ir = true
+optimizer = true
+optimizer_runs = 466
+
+[[profile.default.compilation_restrictions]]
+paths = "lib/midnight/src/ratifiers/**"
+via_ir = true
