@@ -251,5 +251,26 @@ position is untouched to the wei.
 
 ## Cleaning up
 
-The maker closes the Uniswap position; the taker repays and withdraws the collateral. Both sides get
-their capital back, less the fees the position earned, which the maker keeps.
+`script/Unwind.s.sol` returns everything. **The order is forced**: the maker's credit is lent to the
+taker, so `taker()` must run first — running `maker()` first fails Midnight's liquidity check rather
+than doing half the job, which is the good outcome. Every amount is read from chain at execution
+time, so there is no stale figure to leave dust behind.
+
+```shell
+forge script script/Unwind.s.sol --tc Unwind --sig "taker()" \
+  --rpc-url "$BASE_RPC_URL" --account taker --sender "$DEMO_TAKER" --broadcast
+forge script script/Unwind.s.sol --tc Unwind --sig "maker()" \
+  --rpc-url "$BASE_RPC_URL" --account maker --sender "$DEMO_MAKER" --broadcast
+```
+
+Run each without `--broadcast` first — a dry run executes against live state and surfaces a revert
+before it costs anything.
+
+Actual result, 11 Sep 2026: credit 0, debt 0, LP liquidity 0, callback buffer 0. The maker went from
+**81.676097 USDC to 82.172377**. That +0.496280 is almost entirely cbBTC drifting up between buying
+the taker's collateral and selling it back — **not** the strategy earning anything. The part that is
+the design is **+0.025069**, the callback's buffer skimmed home: residual swap rounding that lands in
+the maker's favour. Gas for the whole demo, deploy through unwind, was 0.0000996 ETH (~$0.24).
+
+Position NFT `#5977652` is deliberately not burnt. It sits at zero liquidity with its full history,
+so the link above still resolves to something a reader can inspect.
