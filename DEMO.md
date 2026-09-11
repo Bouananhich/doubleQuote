@@ -15,9 +15,33 @@ steps assert the market id against `0x9593c3a6…` before doing anything else, v
 
 | | |
 |---|---|
-| Deployment | **~$0.36** — measured, 10,295,209 gas at 0.0103 gwei |
+| Deployment | **$0.217** — paid, 7,728,429 gas at 0.0111 gwei (`forge`'s pre-flight estimate of 10,295,824 is padded) |
 | Maker capital | ~$20 — 10 USDC + 10 USDT, returned when the position is closed |
 | Taker capital | ~$26 of cbBTC collateral, returned when the loan is repaid |
+
+## What is deployed
+
+Live on Base, verified on Sourcify (full match — creation *and* runtime).
+
+| | address | |
+|---|---|---|
+| `UniswapV3BuyCallback` | [`0x7D98Cad7E081A77b777E20b0e577722C1d647793`](https://basescan.org/address/0x7D98Cad7E081A77b777E20b0e577722C1d647793) | the callback Midnight calls at settlement |
+| `UniswapV3BuyCallbackFactory` | [`0x4bf90d31c9521fBbC3b5b3B26Af22d5846D78a80`](https://basescan.org/address/0x4bf90d31c9521fBbC3b5b3B26Af22d5846D78a80) | CREATE2, salt `0` |
+| `V3TwapRef` | [`0xE756307f1838f28FCD3B24BD78a923f8965A17e4`](https://basescan.org/address/0xE756307f1838f28FCD3B24BD78a923f8965A17e4) | 1800s `observe()` window on the USDC/USDT pool |
+| `OfferDigest` | [`0x48410042BB5403B85628A4415CBe8e2f50D3f8c4`](https://basescan.org/address/0x48410042BB5403B85628A4415CBe8e2f50D3f8c4) | `view` helper, not part of the protocol |
+
+The callback's immutables read back from chain as `OWNER` = the maker, `MIDNIGHT` = `0xAded…`,
+`ROUTE_POOL` = the USDC/USDT 0.01% pool, `PRICE_REF` = `0xE756…`, and `MAX_SLIPPAGE_WAD` =
+`0x5af3107a4000` = 1e14 = **1bp**. That column is the safety envelope (invariant 3) and it is worth
+reading off the deployment rather than trusting the script.
+
+**The deployed bytecode is the `via_ir` build.** `foundry.toml` scopes `via_ir` to
+`lib/midnight/src/ratifiers/**`, but `Demo.s.sol` reaches `HashLib` through `OfferDigest`, which
+pulls the script's whole compilation unit into the `midnight-ir` profile. The runtime code on Base
+is byte-identical to `out/…/UniswapV3BuyCallback.midnight-ir.json` once the immutable slots are
+masked, and differs from the default artifact — 14,225 bytes against 15,485. `DemoPreflight.t.sol`
+imports the same path and therefore links the same artifacts, so the numbers below were produced by
+the bytecode that is now on Base. The rest of the suite runs the default build. See `JOURNAL.md`.
 
 ## What was pre-flighted
 
@@ -73,12 +97,48 @@ to default it for exactly that reason — an expiry derived from `block.timestam
 call that prints the digest and the transaction that uses it, and the demo would fail at the last
 step, live. The market needs no such care: it is pinned in the script.
 
+### Two things that will bite
+
+**Never let `ETH_PASSWORD` reach a read-only step** — not via `.env`, and not via `export`.
+Foundry auto-loads `.env` for *every* `forge` and `cast` invocation, and `ETH_PASSWORD` is the env
+alias for `--password-file`, so the mere presence of a password path makes a command that signs
+nothing refuse to run: *"the following required arguments were not provided: `--keystore`"*. A plain
+`cast call` hits it, and so does `--sig "quote()"`, which is an `eth_call` against a `view`.
+
+Pass it inline on the two steps that broadcast, and nowhere else:
+
+```shell
+ETH_PASSWORD="$HOME/.foundry/.demo-pass" forge script … --account maker --broadcast
+```
+
+`export ETH_PASSWORD=…` looks equivalent and is not — it poisons every later read in that shell.
+
+**Send one transaction at a time, or pass `--nonce`.** Back-to-back `cast send`s against a hosted
+endpoint raced its pending-nonce view here and failed with *"replacement transaction underpriced"*
+followed by *"nonce too low"* — neither of which reached the chain, which is the confusing part.
+`cast nonce "$DEMO_MAKER"` then an explicit `--nonce` is deterministic.
+
 ## Step 1 — the maker deploys
 
 ```shell
 forge script script/Demo.s.sol --tc Demo --sig "deploy()" \
-  --rpc-url "$BASE_RPC_URL" --account maker --broadcast --verify
+  --rpc-url "$BASE_RPC_URL" --account maker --sender "$DEMO_MAKER" --broadcast
 ```
+
+**`--sender` is not optional.** `--private-key` sets the script's `msg.sender` to the derived
+address; `--account` does not, so without it `setIsAuthorized(…, msg.sender)` runs as forge's
+default sender and the step dies with Midnight's `Unauthorized()` — a protocol-shaped error for a
+Foundry-shaped problem. See `FRICTION.log`.
+
+Verification is a separate step because Basescan wants an API key and Sourcify does not:
+
+```shell
+forge verify-contract <address> <path>:<Name> --chain-id 8453 \
+  --verifier sourcify --compilation-profile midnight-ir --constructor-args <args>
+```
+
+`--compilation-profile` is required — the build carries two profiles and the deployed artifact is
+the `midnight-ir` one.
 
 Export the four addresses it prints (`DEMO_OFFER_DIGEST`, `DEMO_PRICE_REF`, `DEMO_FACTORY`,
 `DEMO_CALLBACK`). It also authorises `EcrecoverRatifier` to speak for the maker.
@@ -146,6 +206,26 @@ forge script script/Demo.s.sol --tc Demo --sig "take()" \
 > Uniswap shows the position at roughly **half** its liquidity, still in range, still earning.
 > `https://app.morpho.org/base/address/$DEMO_MAKER` shows the fixed-rate lending position that did
 > not exist a minute ago.
+
+## What actually happened
+
+Run end to end on Base mainnet, 11 Sep 2026. Every hash below is real.
+
+| step | gas | result |
+|---|---|---|
+| deploy | 7,728,429 | four contracts, $0.217 |
+| park | 723,290 | position [`#5977652`](https://app.uniswap.org/positions/v3/base/5977652), ticks −45 to 55, liquidity 3,938,601,218 |
+| quote | 0 | **19.662374 USDC** — an `eth_call`, no gas |
+| [take](https://basescan.org/tx/0x961bf4cefdcba84301d45c8dd5e756c6979da9462381e52f92a92f0c380a11d5) | 805,616 | taker received **exactly 10.000000 USDC**; position down to 1,930,609,257 |
+
+The position burnt **50.98%**, not the preflight's exactly 50%. That difference is the point rather
+than a discrepancy: the fork ran at a pinned block where the bound was 19.871711, and live it was
+19.662374, because the pool's tick had drifted from 5 to 4 in the meantime. A 10 USDC fill against a
+smaller bound is a slightly larger share of the position, and the bound is recomputed from on-chain
+state at call time — invariant 2, visible in the numbers.
+
+25,069 wei of USDC (2.5 cents) stayed on the callback as buffer, which is the residual swap rounding
+in the maker's favour and is exactly what the buffer is for.
 
 ## Optional — publish it to the orderbook
 
