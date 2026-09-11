@@ -1574,3 +1574,42 @@ Worth noting the shape of it for `FEEDBACK.md`: an integrator can bind Midnight 
 on their own compiler settings right up until they need to **construct or verify an offer**, at
 which point they inherit Midnight's. That is a surprising place for a compiler dependency to appear,
 and nothing signposts it.
+
+## 2026-09-11 (artifacts) — Two tracks, one deliverable, and the Arc calendar
+
+Submitting to **both** the Uniswap Foundation track and Circle's Arc track. They want different
+things, and the honest answer to that is not to build two projects.
+
+The Uniswap track's requirements are hard gates: a public repo, a `FEEDBACK.md`, and a README that
+"clearly points to the relevant contracts and lines of code so we can verify your integration".
+The README now carries a claim → file → line table for every Uniswap surface this project touches,
+built by grepping the actual call sites rather than from memory, and every line anchor in both
+documents was verified against the file before it shipped.
+
+`FEEDBACK.md` was rewritten from scratch. The old one was D1-era speculation whose own header said
+it should not ship unverified — and one of its six claims (the truncated-oracle sample being
+`UNLICENSED` on a side branch) had since been superseded by the real finding: the sample was
+**deleted** from `v4-periphery` entirely. Shipping the old file would have meant shipping a
+confidently wrong claim to the people who own the repo. The new file is 19 findings, each one
+traceable to a `FRICTION.log` entry written in the moment, with a file, a line and a time cost.
+
+**The Arc decision.** Arc public mainnet opens **16 Sep**; the submission deadline is **13 Sep**.
+The prize structure happens to fit that gap rather than fight it — the judged portion is the
+submission, and the conditional tranche is explicitly for being "deployed to Arc Mainnet by
+September 30", a window that opens after we submit.
+
+Arc *testnet* was the tempting shortcut and it does not work. Probed it directly rather than
+trusting the announcements: `eth_getCode` against `rpc.testnet.arc.network` returns code for USDC,
+Permit2 and Multicall3, and **nothing** for Uniswap v4, Uniswap v3, Morpho or Midnight. There is no
+pool to park in and no book to quote to. A deployment there would be a contract that cannot be
+called — a green checkmark standing in for a working system.
+
+So: the demo stays on Base, where all three protocols are real, and `ARC.md` states what is
+deployed, what is not, and why, including the fact that the reference-venue question on Arc is
+genuinely open until we see what ships at launch. A judge should not have to discover that by
+reading the code.
+
+The thing that made this cheap is that it *is* a redeploy rather than a port. The adapters take
+park, route and reference as constructor immutables and bind every venue through an interface, so
+"which chain" was never a property of the contracts. That was a safety decision (invariant 3, the
+safety envelope) and it paid a portability dividend nobody designed it for.
