@@ -207,6 +207,26 @@ forge script script/Demo.s.sol --tc Demo --sig "take()" \
 > `https://app.morpho.org/base/address/$DEMO_MAKER` shows the fixed-rate lending position that did
 > not exist a minute ago.
 
+## What actually happened
+
+Run end to end on Base mainnet, 11 Sep 2026. Every hash below is real.
+
+| step | gas | result |
+|---|---|---|
+| deploy | 7,728,429 | four contracts, $0.217 |
+| park | 723,290 | position [`#5977652`](https://app.uniswap.org/positions/v3/base/5977652), ticks −45 to 55, liquidity 3,938,601,218 |
+| quote | 0 | **19.662374 USDC** — an `eth_call`, no gas |
+| [take](https://basescan.org/tx/0x961bf4cefdcba84301d45c8dd5e756c6979da9462381e52f92a92f0c380a11d5) | 805,616 | taker received **exactly 10.000000 USDC**; position down to 1,930,609,257 |
+
+The position burnt **50.98%**, not the preflight's exactly 50%. That difference is the point rather
+than a discrepancy: the fork ran at a pinned block where the bound was 19.871711, and live it was
+19.662374, because the pool's tick had drifted from 5 to 4 in the meantime. A 10 USDC fill against a
+smaller bound is a slightly larger share of the position, and the bound is recomputed from on-chain
+state at call time — invariant 2, visible in the numbers.
+
+25,069 wei of USDC (2.5 cents) stayed on the callback as buffer, which is the residual swap rounding
+in the maker's favour and is exactly what the buffer is for.
+
 ## Optional — publish it to the orderbook
 
 Morpho indexes offers and the app renders the depth (`https://api.morpho.org/v0/midnight/books`).
