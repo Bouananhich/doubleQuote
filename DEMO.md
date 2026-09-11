@@ -99,10 +99,19 @@ step, live. The market needs no such care: it is pinned in the script.
 
 ### Two things that will bite
 
-**Do not put `ETH_PASSWORD` in `.env`.** Foundry auto-loads `.env` for *every* `forge` and `cast`
-invocation, so a keystore password path sitting there makes a plain read-only `cast call` refuse to
-run: *"the following required arguments were not provided: `--keystore`"*. Pass it per-command
-(`ETH_PASSWORD=~/.foundry/.demo-pass forge script …`) or type the password when prompted.
+**Never let `ETH_PASSWORD` reach a read-only step** — not via `.env`, and not via `export`.
+Foundry auto-loads `.env` for *every* `forge` and `cast` invocation, and `ETH_PASSWORD` is the env
+alias for `--password-file`, so the mere presence of a password path makes a command that signs
+nothing refuse to run: *"the following required arguments were not provided: `--keystore`"*. A plain
+`cast call` hits it, and so does `--sig "quote()"`, which is an `eth_call` against a `view`.
+
+Pass it inline on the two steps that broadcast, and nowhere else:
+
+```shell
+ETH_PASSWORD="$HOME/.foundry/.demo-pass" forge script … --account maker --broadcast
+```
+
+`export ETH_PASSWORD=…` looks equivalent and is not — it poisons every later read in that shell.
 
 **Send one transaction at a time, or pass `--nonce`.** Back-to-back `cast send`s against a hosted
 endpoint raced its pending-nonce view here and failed with *"replacement transaction underpriced"*
