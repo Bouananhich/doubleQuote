@@ -44,7 +44,8 @@ interface IOfferDigest {
 /// and a round **10 USDC fill burns exactly half the position**, which is the number worth showing:
 /// half the LP settles the loan, half stays in the pool earning.
 ///
-/// @dev **What each step costs.** Deployment is ~$0.17 at Base's current gas. The capital is ~$20
+/// @dev **What each step costs.** Deployment measured $0.217 on Base — 7,728,429 gas at 0.0111
+/// gwei, against a padded `forge` estimate of 10,295,824. The capital is ~$20
 /// for the position and ~$26 of cbBTC for the taker's collateral, and both come back.
 ///
 /// @dev Run with `--sig`, one step at a time. See `DEMO.md`.

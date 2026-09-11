@@ -168,6 +168,19 @@ the build stays **enumerated and unchanged** (see [`FEEDBACK.md` §E2](./FEEDBAC
 quote it into Midnight's book, fill the offer, and watch the LP position unwind into a Morpho
 lending position — visible in the Uniswap and Morpho frontends throughout.
 
+**Deployed on Base**, verified on Sourcify (full match, creation and runtime):
+
+| contract | address |
+|---|---|
+| [`UniswapV3BuyCallback`](./src/UniswapV3BuyCallback.sol) | [`0x7D98Cad7E081A77b777E20b0e577722C1d647793`](https://basescan.org/address/0x7D98Cad7E081A77b777E20b0e577722C1d647793) |
+| [`UniswapV3BuyCallbackFactory`](./src/UniswapV3BuyCallbackFactory.sol) | [`0x4bf90d31c9521fBbC3b5b3B26Af22d5846D78a80`](https://basescan.org/address/0x4bf90d31c9521fBbC3b5b3B26Af22d5846D78a80) |
+| [`V3TwapRef`](./src/price-refs/V3TwapRef.sol) | [`0xE756307f1838f28FCD3B24BD78a923f8965A17e4`](https://basescan.org/address/0xE756307f1838f28FCD3B24BD78a923f8965A17e4) |
+| [`OfferDigest`](./script/OfferDigest.sol) | [`0x48410042BB5403B85628A4415CBe8e2f50D3f8c4`](https://basescan.org/address/0x48410042BB5403B85628A4415CBe8e2f50D3f8c4) |
+
+Total deployment cost **$0.217** (7,728,429 gas). The callback's safety envelope reads back from
+chain: `MAX_SLIPPAGE_WAD` = `0x5af3107a4000` = 1e14 = **1bp**, `ROUTE_POOL` = the USDC/USDT 0.01%
+pool, `PRICE_REF` = the `V3TwapRef` above.
+
 ---
 
 ## Arc

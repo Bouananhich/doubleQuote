@@ -352,3 +352,41 @@ part that makes the feedback actionable and the part that is impossible to recon
     diagnosis; shipping a precomputed-digest helper, or a view function on the ratifier that returns
     the digest for an offer, would remove the need to compile it at all.
     (cost: ~25m)
+
+2026-09-11 14:48  [foundry]  `--account` does not set `msg.sender`, and the error blames the protocol.
+    `forge script --sig "deploy()" --account maker` died with Midnight's `Unauthorized()`. The same
+    script under `--private-key` had simulated clean minutes earlier. `--private-key` sets the
+    script's `msg.sender` to the derived address; `--account` resolves a signer for broadcasting but
+    leaves `msg.sender` as forge's default `0x1804c8Ab…`, so `setIsAuthorized(ratifier, true,
+    msg.sender)` authorised for an address that is not the maker and Midnight refused it.
+    The failure is a protocol-level custom error for a wallet-plumbing problem, which is the worst
+    possible signpost: the first place you look is the authorisation model. `--sender` fixes it.
+    A warning when `--account`/`--keystore` is given without `--sender` would close it entirely —
+    forge already knows the keystore's address, so the two disagreeing is always a mistake.
+    (cost: ~15m, and it would have cost the demo if it had surfaced live)
+
+2026-09-11 14:55  [foundry]  A keystore password in `.env` breaks every read-only `cast call`.
+    Foundry auto-loads `.env` for *all* invocations, and `ETH_PASSWORD` is the env alias for
+    `--password-file`. Putting it there — the obvious place, next to `BASE_RPC_URL` — makes an
+    unrelated `cast call <addr> 'balanceOf(address)(uint256)'` fail with "the following required
+    arguments were not provided: `--keystore <PATH>`", on a call that signs nothing and sends
+    nothing. `unset ETH_PASSWORD` does not help, because `.env` is re-read per process.
+    Reading a password path should not imply a wallet is required; it should apply only once a
+    signer is actually needed.
+    (cost: ~10m)
+
+2026-09-11 15:10  [foundry]  `additional_compiler_profiles` silently decides what you deploy.
+    `foundry.toml` restricts `via_ir` to `lib/midnight/src/ratifiers/**` specifically to keep the
+    rest of the build on one profile. It does not: `Demo.s.sol` imports `OfferDigest`, which imports
+    `HashLib` from that path, so the script's whole compilation unit resolves to the `midnight-ir`
+    profile and every contract it deploys is the IR build. The on-chain runtime code is
+    byte-identical to `UniswapV3BuyCallback.midnight-ir.json` with immutables masked (14,225 bytes)
+    and differs from the default artifact (15,485). Nothing in the broadcast output says "you are
+    deploying the non-default profile" beyond a `.midnight-ir` suffix on the contract name, which
+    reads as a label rather than a warning.
+    It surfaces again at verification: `forge verify-contract` refuses with "Ambiguous compilation
+    profiles found in cache" and needs `--compilation-profile`, which is at least an honest error.
+    The consequence worth stating is that the suite and the deployment can exercise different
+    bytecode — here they happen to overlap only on `DemoPreflight.t.sol`, which imports the same
+    path. That is luck, not design.
+    (cost: ~20m, most of it convincing myself the deployment was the thing I had tested)

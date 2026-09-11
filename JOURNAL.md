@@ -1613,3 +1613,40 @@ The thing that made this cheap is that it *is* a redeploy rather than a port. Th
 park, route and reference as constructor immutables and bind every venue through an interface, so
 "which chain" was never a property of the contracts. That was a safety decision (invariant 3, the
 safety envelope) and it paid a portability dividend nobody designed it for.
+
+## 2026-09-11 (deploy) — Live on Base, and the profile we did not know we were shipping
+
+The callback is deployed. `0x7D98Cad7E081A77b777E20b0e577722C1d647793`, owned by the maker,
+routing through the USDC/USDT 0.01% pool, referencing `V3TwapRef` at `0xE756…`, with a 1bp budget —
+all four immutables read back off chain rather than taken on the script's word, because that column
+is the safety envelope and a deployment is the last place to trust a `console.log`. Deployment cost
+**$0.217**, 7,728,429 gas, against `forge`'s padded estimate of 10,295,824.
+
+**Verification went to Sourcify, not Basescan.** Basescan wants an Etherscan key we do not have;
+Sourcify wants nothing and returns a *full* match — creation code and runtime code both. It also
+forwards to Etherscan and Blockscout on your behalf, which is the part worth knowing: both refused
+today on shared-quota limits, so a Basescan listing still needs our own key. The verification that
+matters for a reviewer — "is this source the source that produced that bytecode" — is already
+answered, by a third party, for all four contracts.
+
+**The finding of the day is one we caused ourselves.** `foundry.toml` scopes `via_ir` to
+`lib/midnight/src/ratifiers/**`, and the comment there claims that "keeps the single-profile promise
+for everything else." It does not. `Demo.s.sol` imports `OfferDigest` → `HashLib`, which lives under
+that path, so the script's entire compilation unit resolves to `midnight-ir` and **every contract
+this demo deployed is the IR build**. Confirmed the hard way rather than inferred: the runtime code
+on Base is byte-identical to `UniswapV3BuyCallback.midnight-ir.json` once the immutable slots are
+masked — 14,225 bytes — and differs from the default artifact at 15,485.
+
+That splits the suite from the deployment. Most of the 207 tests link the default artifacts;
+`DemoPreflight.t.sol` imports the ratifier path and therefore links `midnight-ir`. So the numbers we
+are about to show on stage — 19.871711 USDC of bound, a 10 USDC fill burning exactly half — were
+produced by exactly the bytecode now on Base, and the rest of the coverage was not. The overlap is
+correct by accident.
+
+Not fixing it before the demo, deliberately. The two builds are the same Solidity under different
+codegen, the one test that pins the deployed configuration already runs against the deployed
+profile, and widening `via_ir` to the whole project two days out would invalidate every gas number
+in `FEEDBACK.md` and `DEMO.md` for no safety gain. It is recorded here and in `DEMO.md` because a
+reader deserves to know which artifact they are looking at, and the honest version of the
+`foundry.toml` comment is "restricting the setting to that one path keeps the single-profile promise
+for everything that does not import it" — which is a weaker promise than the one written down.
